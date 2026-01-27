@@ -3,7 +3,6 @@ package miniofs
 import (
 	"context"
 	"errors"
-	"log"
 	"net/url"
 	"os"
 	"strings"
@@ -86,7 +85,12 @@ func (fs *Fs) Create(name string) (afero.File, error) {
 
 func (fs *Fs) Mkdir(name string, _ os.FileMode) error {
 	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
-	
+
+	// Check context
+	if err := fs.ctx.Err(); err != nil {
+		return ErrContextCanceled
+	}
+
 	// Check if parent exists
 	if name != "" && name != "." {
 		parent := strings.TrimSuffix(name, fs.separator)
@@ -94,59 +98,67 @@ func (fs *Fs) Mkdir(name string, _ os.FileMode) error {
 		if lastSep > 0 {
 			parentPath := parent[:lastSep]
 			if _, err := fs.Stat(parentPath); err != nil {
-				return err
+				return NewPathError("mkdir", name, err)
 			}
 		}
 	}
-	
+
 	// Check if directory already exists
 	if _, err := fs.Stat(name); err == nil {
-		return os.ErrExist
+		return NewPathError("mkdir", name, os.ErrExist)
 	}
-	
+
 	// Create directory by uploading an empty object with trailing separator
 	dirName := strings.TrimSuffix(name, fs.separator) + fs.separator
-	return fs.createEmptyObject(dirName)
+	if err := fs.createEmptyObject(dirName); err != nil {
+		return NewPathError("mkdir", name, err)
+	}
+	return nil
 }
 
 func (fs *Fs) MkdirAll(name string, perm os.FileMode) error {
 	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
-	
+
 	if name == "" || name == "." {
 		return nil
 	}
-	
+
+	// Check context
+	if err := fs.ctx.Err(); err != nil {
+		return ErrContextCanceled
+	}
+
 	// Check if already exists
 	if fi, err := fs.Stat(name); err == nil {
 		if fi.IsDir() {
 			return nil
 		}
-		return os.ErrExist
+		return NewPathError("mkdir", name, os.ErrExist)
 	}
-	
+
 	// Create all parent directories
 	parts := strings.Split(strings.TrimSuffix(name, fs.separator), fs.separator)
 	currentPath := ""
-	
+
 	for _, part := range parts {
 		if part == "" {
 			continue
 		}
-		
+
 		if currentPath != "" {
 			currentPath += fs.separator
 		}
 		currentPath += part
-		
+
 		// Try to create directory, ignore if exists
 		if _, err := fs.Stat(currentPath); err != nil {
 			dirName := currentPath + fs.separator
 			if err := fs.createEmptyObject(dirName); err != nil {
-				return err
+				return NewPathError("mkdir", currentPath, err)
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -164,49 +176,111 @@ func (fs *Fs) Open(name string) (afero.File, error) {
 }
 
 func (fs *Fs) OpenFile(name string, flag int, fileMode os.FileMode) (afero.File, error) {
-	var err error
 	if flag&os.O_APPEND != 0 {
-		return nil, errors.New("appending files will lead to trouble")
+		return nil, NewPathError("open", name, errors.New("O_APPEND not supported for MinIO"))
 	}
 
 	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
-	file := NewMinioFile(fs.ctx, fs, flag, fileMode, name)
-	//
+
+	// Check if file exists
+	_, statErr := fs.Stat(name)
+	fileExists := statErr == nil
+
+	// Handle O_CREATE flag
 	if flag&os.O_CREATE != 0 {
-		_, err = file.WriteString("")
+		if fileExists && flag&os.O_EXCL != 0 {
+			return nil, os.ErrExist
+		}
+	} else {
+		// If not creating and file doesn't exist, return error
+		if !fileExists {
+			return nil, NewPathError("open", name, os.ErrNotExist)
+		}
 	}
 
-	return file, err
+	file := NewMinioFile(fs.ctx, fs, flag, fileMode, name)
+
+	// Handle O_CREATE - create empty file if it doesn't exist
+	if flag&os.O_CREATE != 0 && !fileExists {
+		if _, err := file.WriteString(""); err != nil {
+			file.Close()
+			return nil, NewPathError("create", name, err)
+		}
+	}
+
+	// Handle O_TRUNC - truncate file to zero length
+	if flag&os.O_TRUNC != 0 && fileExists {
+		if err := file.Truncate(0); err != nil {
+			file.Close()
+			return nil, NewPathError("truncate", name, err)
+		}
+	}
+
+	return file, nil
 }
 
 func (fs *Fs) Remove(name string) error {
 	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
-	return fs.client.RemoveObject(fs.ctx, fs.bucket, name, minio.RemoveObjectOptions{
+
+	// Check context
+	if err := fs.ctx.Err(); err != nil {
+		return ErrContextCanceled
+	}
+
+	err := fs.client.RemoveObject(fs.ctx, fs.bucket, name, minio.RemoveObjectOptions{
 		GovernanceBypass: true,
 	})
+	if err != nil {
+		return NewPathError("remove", name, err)
+	}
+	return nil
 }
 
 func (fs *Fs) RemoveAll(path string) error {
 	path = fs.ensureNoLeadingSeparator(fs.normSeparators(path))
 
+	// Check context
+	if err := fs.ctx.Err(); err != nil {
+		return ErrContextCanceled
+	}
+
 	objectsCh := make(chan minio.ObjectInfo)
+	errCh := make(chan error, 1)
+
+	// Start goroutine to list objects
 	go func() {
 		defer close(objectsCh)
 		opts := minio.ListObjectsOptions{Prefix: path, Recursive: true}
 		for object := range fs.client.ListObjects(fs.ctx, fs.bucket, opts) {
 			if object.Err != nil {
-				log.Fatalln(object.Err)
+				errCh <- NewPathError("list", path, object.Err)
+				return
 			}
 			objectsCh <- object
 		}
 	}()
 
-	errorCh := fs.client.RemoveObjects(fs.ctx, fs.bucket, objectsCh, minio.RemoveObjectsOptions{})
-	for e := range errorCh {
-		return errors.New("Failed to remove " + e.ObjectName + ", error: " + e.Err.Error())
+	// Remove objects in batch
+	removeErrCh := fs.client.RemoveObjects(fs.ctx, fs.bucket, objectsCh, minio.RemoveObjectsOptions{})
+
+	// Collect errors
+	var firstErr error
+	for e := range removeErrCh {
+		if firstErr == nil {
+			firstErr = NewPathError("remove", e.ObjectName, e.Err)
+		}
 	}
 
-	return nil
+	// Check if listing encountered an error
+	select {
+	case err := <-errCh:
+		if err != nil && firstErr == nil {
+			return err
+		}
+	default:
+	}
+
+	return firstErr
 }
 
 func (fs *Fs) Rename(oldName, newName string) error {
@@ -217,7 +291,22 @@ func (fs *Fs) Rename(oldName, newName string) error {
 	oldName = fs.ensureNoLeadingSeparator(fs.normSeparators(oldName))
 	newName = fs.ensureNoLeadingSeparator(fs.normSeparators(newName))
 
-	// Source object
+	// Check context
+	if err := fs.ctx.Err(); err != nil {
+		return ErrContextCanceled
+	}
+
+	// Check if source exists
+	if _, err := fs.Stat(oldName); err != nil {
+		return NewPathError("rename", oldName, os.ErrNotExist)
+	}
+
+	// Check if destination already exists
+	if _, err := fs.Stat(newName); err == nil {
+		return NewPathError("rename", newName, os.ErrExist)
+	}
+
+	// Copy object
 	src := minio.CopySrcOptions{
 		Bucket: fs.bucket,
 		Object: oldName,
@@ -228,10 +317,17 @@ func (fs *Fs) Rename(oldName, newName string) error {
 	}
 	_, err := fs.client.CopyObject(fs.ctx, dst, src)
 	if err != nil {
-		return err
+		return NewPathError("rename", oldName, err)
 	}
 
-	return fs.Remove(oldName)
+	// Remove old object
+	if err := fs.Remove(oldName); err != nil {
+		// Try to clean up the copy if delete fails
+		_ = fs.Remove(newName)
+		return NewPathError("rename", oldName, err)
+	}
+
+	return nil
 }
 
 func (fs *Fs) Stat(name string) (os.FileInfo, error) {

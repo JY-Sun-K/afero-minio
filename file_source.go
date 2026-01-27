@@ -27,7 +27,8 @@ type minioFileResource struct {
 	name     string
 	fileMode os.FileMode
 
-	currentIoSize int64
+	currentIoSize int64 // Current size of the file
+	sizeKnown     bool  // Whether currentIoSize has been determined
 	offset        int64
 	reader        readerAtCloser
 	writer        io.WriteCloser
@@ -36,8 +37,10 @@ type minioFileResource struct {
 }
 
 func (o *minioFileResource) Close() error {
+	if o.closed {
+		return nil
+	}
 	o.closed = true
-	// TODO rawGcsObjectsMap ?
 	return o.maybeCloseIo()
 }
 
@@ -85,12 +88,17 @@ func (o *minioFileResource) maybeCloseWriter() error {
 }
 
 func (o *minioFileResource) ReadAt(p []byte, off int64) (n int, err error) {
-	if cap(p) == 0 {
+	if len(p) == 0 {
 		return 0, nil
 	}
 
 	if off < 0 {
-		return 0, ErrOutOfRange
+		return 0, ErrNegativeOffset
+	}
+
+	// Check context
+	if err := o.ctx.Err(); err != nil {
+		return 0, ErrContextCanceled
 	}
 
 	// If any writers have written anything; commit it first so we can read it back.
@@ -101,7 +109,7 @@ func (o *minioFileResource) ReadAt(p []byte, off int64) (n int, err error) {
 	opts := minio.GetObjectOptions{}
 	r, err := o.fs.client.GetObject(o.ctx, o.fs.bucket, o.name, opts)
 	if err != nil {
-		return 0, err
+		return 0, NewPathError("read", o.name, err)
 	}
 	defer func() {
 		if closeErr := r.Close(); closeErr != nil && err == nil {
@@ -112,11 +120,12 @@ func (o *minioFileResource) ReadAt(p []byte, off int64) (n int, err error) {
 	// Get object info to check size
 	stat, err := r.Stat()
 	if err != nil {
-		return 0, err
+		return 0, NewPathError("stat", o.name, err)
 	}
 
 	// Update current size
 	o.currentIoSize = stat.Size
+	o.sizeKnown = true
 
 	// If offset is beyond file size, return EOF
 	if off >= stat.Size {
@@ -130,9 +139,38 @@ func (o *minioFileResource) ReadAt(p []byte, off int64) (n int, err error) {
 }
 
 func (o *minioFileResource) WriteAt(b []byte, off int64) (n int, err error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+
+	if off < 0 {
+		return 0, ErrNegativeOffset
+	}
+
+	// Check context
+	if err := o.ctx.Err(); err != nil {
+		return 0, ErrContextCanceled
+	}
+
 	// Ensure readers must be closed before writing
 	if err = o.maybeCloseIo(); err != nil {
 		return 0, err
+	}
+
+	// Determine current file size if not known
+	if !o.sizeKnown {
+		stat, err := o.fs.client.StatObject(o.ctx, o.fs.bucket, o.name, minio.StatObjectOptions{})
+		if err != nil {
+			// If file doesn't exist, size is 0
+			mErr, ok := err.(minio.ErrorResponse)
+			if !ok || mErr.Code != "NoSuchKey" {
+				return 0, NewPathError("stat", o.name, err)
+			}
+			o.currentIoSize = 0
+		} else {
+			o.currentIoSize = stat.Size
+		}
+		o.sizeKnown = true
 	}
 
 	// For MinIO, we need to handle writes carefully
@@ -144,7 +182,7 @@ func (o *minioFileResource) WriteAt(b []byte, off int64) (n int, err error) {
 		}
 		_, err = o.fs.client.PutObject(o.ctx, o.fs.bucket, o.name, buffer, int64(len(b)), opts)
 		if err != nil {
-			return 0, err
+			return 0, NewPathError("write", o.name, err)
 		}
 		o.offset = int64(len(b))
 		o.currentIoSize = int64(len(b))
@@ -159,13 +197,13 @@ func (o *minioFileResource) WriteAt(b []byte, off int64) (n int, err error) {
 		opts := minio.GetObjectOptions{}
 		reader, err := o.fs.client.GetObject(o.ctx, o.fs.bucket, o.name, opts)
 		if err != nil {
-			return 0, err
+			return 0, NewPathError("read", o.name, err)
 		}
 		defer reader.Close()
-		
+
 		existingData, err = io.ReadAll(reader)
 		if err != nil {
-			return 0, err
+			return 0, NewPathError("read", o.name, err)
 		}
 	}
 
@@ -187,7 +225,7 @@ func (o *minioFileResource) WriteAt(b []byte, off int64) (n int, err error) {
 	}
 	_, err = o.fs.client.PutObject(o.ctx, o.fs.bucket, o.name, buffer, int64(len(existingData)), opts)
 	if err != nil {
-		return 0, err
+		return 0, NewPathError("write", o.name, err)
 	}
 
 	o.offset = off + int64(len(b))
@@ -196,13 +234,18 @@ func (o *minioFileResource) WriteAt(b []byte, off int64) (n int, err error) {
 }
 
 func (o *minioFileResource) Truncate(size int64) error {
+	if size < 0 {
+		return ErrNegativeOffset
+	}
+
+	// Check context
+	if err := o.ctx.Err(); err != nil {
+		return ErrContextCanceled
+	}
+
 	// Close any open readers/writers
 	if err := o.maybeCloseIo(); err != nil {
 		return err
-	}
-
-	if size < 0 {
-		return ErrOutOfRange
 	}
 
 	// If truncating to 0, just create empty file
@@ -210,9 +253,10 @@ func (o *minioFileResource) Truncate(size int64) error {
 		opts := minio.PutObjectOptions{}
 		_, err := o.fs.client.PutObject(o.ctx, o.fs.bucket, o.name, bytes.NewReader([]byte{}), 0, opts)
 		if err != nil {
-			return err
+			return NewPathError("truncate", o.name, err)
 		}
 		o.currentIoSize = 0
+		o.sizeKnown = true
 		o.offset = 0
 		return nil
 	}
@@ -221,13 +265,26 @@ func (o *minioFileResource) Truncate(size int64) error {
 	opts := minio.GetObjectOptions{}
 	reader, err := o.fs.client.GetObject(o.ctx, o.fs.bucket, o.name, opts)
 	if err != nil {
-		return err
+		// If file doesn't exist, create it with zeros
+		mErr, ok := err.(minio.ErrorResponse)
+		if ok && mErr.Code == "NoSuchKey" {
+			newData := make([]byte, size)
+			putOpts := minio.PutObjectOptions{}
+			_, err = o.fs.client.PutObject(o.ctx, o.fs.bucket, o.name, bytes.NewReader(newData), size, putOpts)
+			if err != nil {
+				return NewPathError("truncate", o.name, err)
+			}
+			o.currentIoSize = size
+			o.sizeKnown = true
+			return nil
+		}
+		return NewPathError("truncate", o.name, err)
 	}
 	defer reader.Close()
 
 	existingData, err := io.ReadAll(reader)
 	if err != nil {
-		return err
+		return NewPathError("read", o.name, err)
 	}
 
 	var newData []byte
@@ -240,6 +297,8 @@ func (o *minioFileResource) Truncate(size int64) error {
 		copy(newData, existingData)
 	} else {
 		// Same size, no change needed
+		o.currentIoSize = size
+		o.sizeKnown = true
 		return nil
 	}
 
@@ -247,9 +306,10 @@ func (o *minioFileResource) Truncate(size int64) error {
 	putOpts := minio.PutObjectOptions{}
 	_, err = o.fs.client.PutObject(o.ctx, o.fs.bucket, o.name, bytes.NewReader(newData), int64(len(newData)), putOpts)
 	if err != nil {
-		return err
+		return NewPathError("truncate", o.name, err)
 	}
 
 	o.currentIoSize = size
+	o.sizeKnown = true
 	return nil
 }

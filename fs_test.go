@@ -54,7 +54,7 @@ func TestNewMinioFs(t *testing.T) {
 
 func TestCreateAndWrite(t *testing.T) {
 	fs := getTestFs(t)
-	
+
 	testFile := "test-create-write.txt"
 	testContent := "Hello, MinIO!"
 
@@ -93,7 +93,7 @@ func TestCreateAndWrite(t *testing.T) {
 
 func TestReadWrite(t *testing.T) {
 	fs := getTestFs(t)
-	
+
 	testFile := "test-read-write.txt"
 	testData := []byte("This is a test file with some content.")
 
@@ -119,7 +119,7 @@ func TestReadWrite(t *testing.T) {
 
 func TestMkdir(t *testing.T) {
 	fs := getTestFs(t)
-	
+
 	testDir := "test-dir"
 
 	t.Cleanup(func() {
@@ -153,7 +153,7 @@ func TestMkdir(t *testing.T) {
 
 func TestMkdirAll(t *testing.T) {
 	fs := getTestFs(t)
-	
+
 	testPath := "test-dir/sub1/sub2/sub3"
 
 	t.Cleanup(func() {
@@ -181,7 +181,7 @@ func TestMkdirAll(t *testing.T) {
 
 func TestRemove(t *testing.T) {
 	fs := getTestFs(t)
-	
+
 	testFile := "test-remove.txt"
 
 	// 创建文件
@@ -205,7 +205,7 @@ func TestRemove(t *testing.T) {
 
 func TestRemoveAll(t *testing.T) {
 	fs := getTestFs(t)
-	
+
 	testDir := "test-remove-all"
 
 	t.Cleanup(func() {
@@ -246,7 +246,7 @@ func TestRemoveAll(t *testing.T) {
 
 func TestRename(t *testing.T) {
 	fs := getTestFs(t)
-	
+
 	oldName := "test-rename-old.txt"
 	newName := "test-rename-new.txt"
 	testContent := "rename test content"
@@ -286,7 +286,7 @@ func TestRename(t *testing.T) {
 
 func TestStat(t *testing.T) {
 	fs := getTestFs(t)
-	
+
 	testFile := "test-stat.txt"
 	testContent := []byte("stat test")
 
@@ -320,7 +320,7 @@ func TestStat(t *testing.T) {
 
 func TestReaddir(t *testing.T) {
 	fs := getTestFs(t)
-	
+
 	testDir := "test-readdir"
 
 	t.Cleanup(func() {
@@ -365,7 +365,7 @@ func TestReaddir(t *testing.T) {
 
 func TestTruncate(t *testing.T) {
 	fs := getTestFs(t)
-	
+
 	testFile := "test-truncate.txt"
 	originalContent := []byte("This is original content with more data")
 
@@ -403,7 +403,7 @@ func TestTruncate(t *testing.T) {
 
 func TestSeek(t *testing.T) {
 	fs := getTestFs(t)
-	
+
 	testFile := "test-seek.txt"
 	testContent := []byte("0123456789ABCDEFGHIJ")
 
@@ -448,7 +448,7 @@ func TestSeek(t *testing.T) {
 
 func TestOpenFile(t *testing.T) {
 	fs := getTestFs(t)
-	
+
 	testFile := "test-openfile.txt"
 
 	t.Cleanup(func() {

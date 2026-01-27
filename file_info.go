@@ -23,20 +23,22 @@ type FileInfo struct {
 }
 
 func newFileInfoFromAttrs(obj minio.ObjectInfo, fileMode os.FileMode) *FileInfo {
+	// Check if this is a directory (ends with separator)
+	isDir := strings.HasSuffix(obj.Key, "/")
+	size := obj.Size
+
+	// Empty objects with trailing slash are directories
+	if isDir && size == 0 {
+		size = folderSize
+	}
+
 	res := &FileInfo{
 		eTag:     obj.ETag,
 		name:     obj.Key,
-		size:     obj.Size,
+		size:     size,
 		updated:  obj.LastModified,
-		isDir:    false,
+		isDir:    isDir,
 		fileMode: fileMode,
-	}
-
-	if res.name == "" {
-		// deals with them at the moment
-		//res.name = "folder"
-		res.size = folderSize
-		res.isDir = true
 	}
 
 	return res
@@ -72,10 +74,13 @@ func (fi *FileInfo) Sys() interface{} {
 type ByName []*FileInfo
 
 func (a ByName) Len() int { return len(a) }
+
+// Swap exchanges the elements with indexes i and j
 func (a ByName) Swap(i, j int) {
-	a[i].name, a[j].name = a[j].name, a[i].name
-	a[i].size, a[j].size = a[j].size, a[i].size
-	a[i].updated, a[j].updated = a[j].updated, a[i].updated
-	a[i].isDir, a[j].isDir = a[j].isDir, a[i].isDir
+	a[i], a[j] = a[j], a[i]
 }
-func (a ByName) Less(i, j int) bool { return strings.Compare(a[i].Name(), a[j].Name()) == -1 }
+
+// Less reports whether the element with index i should sort before the element with index j
+func (a ByName) Less(i, j int) bool {
+	return strings.Compare(a[i].Name(), a[j].Name()) < 0
+}

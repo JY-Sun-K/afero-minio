@@ -2,7 +2,6 @@ package miniofs
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log"
 	"os"
@@ -28,16 +27,16 @@ func NewMinioFile(ctx context.Context, fs *Fs, openFlags int, fileMode os.FileMo
 		fhOffset:  0,
 		closed:    false,
 		resource: &minioFileResource{
-			ctx:      ctx,
-			fs:       fs,
-			name:     name,
-			fileMode: fileMode,
-
+			ctx:           ctx,
+			fs:            fs,
+			name:          name,
+			fileMode:      fileMode,
 			currentIoSize: 0,
-
-			offset: 0,
-			reader: nil,
-			writer: nil,
+			sizeKnown:     false,
+			offset:        0,
+			reader:        nil,
+			writer:        nil,
+			closed:        false,
 		},
 	}
 }
@@ -57,29 +56,44 @@ func (o *MinioFile) Seek(newOffset int64, whence int) (int64, error) {
 	}
 
 	// Since this is an expensive operation; let's make sure we need it
-	if (whence == 0 && newOffset == o.fhOffset) || (whence == 1 && newOffset == 0) {
+	if (whence == io.SeekStart && newOffset == o.fhOffset) || (whence == io.SeekCurrent && newOffset == 0) {
 		return o.fhOffset, nil
 	}
-	log.Printf("WARNING: Seek behavior triggered, highly inefficent. Offset before seek is at %d\n", o.fhOffset)
 
-	// Fore the reader/writers to be reopened (at correct offset)
+	// Log warning for performance awareness (optional, can be removed in production)
+	if whence != io.SeekStart || newOffset != 0 {
+		log.Printf("WARNING: Seek behavior triggered, highly inefficient. Offset before seek is at %d\n", o.fhOffset)
+	}
+
+	// Force the reader/writers to be reopened (at correct offset)
 	err := o.Sync()
 	if err != nil {
 		return 0, err
 	}
-	stat, err := o.Stat()
-	if err != nil {
-		return 0, nil
-	}
 
+	// Calculate new offset based on whence
+	var newPos int64
 	switch whence {
 	case io.SeekStart:
-		o.fhOffset = newOffset
+		newPos = newOffset
 	case io.SeekCurrent:
-		o.fhOffset += newOffset
+		newPos = o.fhOffset + newOffset
 	case io.SeekEnd:
-		o.fhOffset = stat.Size() + newOffset
+		stat, err := o.Stat()
+		if err != nil {
+			return 0, err
+		}
+		newPos = stat.Size() + newOffset
+	default:
+		return 0, ErrInvalidSeekWhence
 	}
+
+	// Validate new position
+	if newPos < 0 {
+		return 0, ErrNegativeOffset
+	}
+
+	o.fhOffset = newPos
 	return o.fhOffset, nil
 }
 
@@ -90,6 +104,15 @@ func (o *MinioFile) Read(p []byte) (n int, err error) {
 func (o *MinioFile) ReadAt(p []byte, off int64) (n int, err error) {
 	if o.closed {
 		return 0, ErrFileClosed
+	}
+
+	if off < 0 {
+		return 0, ErrNegativeOffset
+	}
+
+	// Check for read permission
+	if o.openFlags&os.O_WRONLY != 0 {
+		return 0, ErrWriteOnlyFile
 	}
 
 	read, err := o.resource.ReadAt(p, off)
@@ -106,8 +129,17 @@ func (o *MinioFile) WriteAt(b []byte, off int64) (n int, err error) {
 		return 0, ErrFileClosed
 	}
 
+	if off < 0 {
+		return 0, ErrNegativeOffset
+	}
+
 	if o.openFlags&os.O_RDONLY != 0 {
-		return 0, fmt.Errorf("file is opend as read only")
+		return 0, ErrReadOnlyFile
+	}
+
+	// Check for write permission
+	if o.openFlags&(os.O_WRONLY|os.O_RDWR) == 0 {
+		return 0, ErrReadOnlyFile
 	}
 
 	written, err := o.resource.WriteAt(b, off)
@@ -181,9 +213,9 @@ func (o *MinioFile) readdirImpl(count int) ([]*FileInfo, error) {
 
 		// Create FileInfo with full path for proper stat
 		fullPath := prefix + childName
-		isDir := strings.HasSuffix(obj.Key, o.resource.fs.separator) || 
-		         strings.Contains(strings.TrimPrefix(obj.Key, prefix), o.resource.fs.separator)
-		
+		isDir := strings.HasSuffix(obj.Key, o.resource.fs.separator) ||
+			strings.Contains(strings.TrimPrefix(obj.Key, prefix), o.resource.fs.separator)
+
 		fi := &FileInfo{
 			eTag:     obj.ETag,
 			name:     fullPath,
@@ -258,9 +290,20 @@ func (o *MinioFile) Truncate(wantedSize int64) error {
 	if o.closed {
 		return ErrFileClosed
 	}
-	if o.openFlags == os.O_RDONLY {
-		return fmt.Errorf("file was opened as read only")
+
+	if wantedSize < 0 {
+		return ErrNegativeOffset
 	}
+
+	if o.openFlags&os.O_RDONLY != 0 {
+		return ErrReadOnlyFile
+	}
+
+	// Check for write permission
+	if o.openFlags&(os.O_WRONLY|os.O_RDWR) == 0 {
+		return ErrReadOnlyFile
+	}
+
 	return o.resource.Truncate(wantedSize)
 }
 
