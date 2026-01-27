@@ -25,12 +25,28 @@ type Fs struct {
 	separator string
 }
 
-func NewMinioFs(ctx context.Context, dsn string) afero.Fs {
-	url, _ := url.Parse(dsn)
-	minioOpts, _ := ParseURL(dsn)
+func NewMinioFs(ctx context.Context, dsn string) (afero.Fs, error) {
+	parsedURL, err := url.Parse(dsn)
+	if err != nil {
+		return nil, err
+	}
 
-	client, _ := minio.New(url.Host, minioOpts)
-	return NewFs(ctx, client, url.Path[1:])
+	minioOpts, err := ParseURL(dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := minio.New(parsedURL.Host, minioOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	bucket := strings.TrimPrefix(parsedURL.Path, "/")
+	if bucket == "" {
+		return nil, ErrNoBucketInName
+	}
+
+	return NewFs(ctx, client, bucket), nil
 }
 
 func NewFs(ctx context.Context, client *minio.Client, bucket string) *Fs {
@@ -69,11 +85,78 @@ func (fs *Fs) Create(name string) (afero.File, error) {
 }
 
 func (fs *Fs) Mkdir(name string, _ os.FileMode) error {
-	return ErrNotSupported
+	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
+	
+	// Check if parent exists
+	if name != "" && name != "." {
+		parent := strings.TrimSuffix(name, fs.separator)
+		lastSep := strings.LastIndex(parent, fs.separator)
+		if lastSep > 0 {
+			parentPath := parent[:lastSep]
+			if _, err := fs.Stat(parentPath); err != nil {
+				return err
+			}
+		}
+	}
+	
+	// Check if directory already exists
+	if _, err := fs.Stat(name); err == nil {
+		return os.ErrExist
+	}
+	
+	// Create directory by uploading an empty object with trailing separator
+	dirName := strings.TrimSuffix(name, fs.separator) + fs.separator
+	return fs.createEmptyObject(dirName)
 }
 
-func (fs *Fs) MkdirAll(_ string, _ os.FileMode) error {
-	return ErrNotSupported
+func (fs *Fs) MkdirAll(name string, perm os.FileMode) error {
+	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
+	
+	if name == "" || name == "." {
+		return nil
+	}
+	
+	// Check if already exists
+	if fi, err := fs.Stat(name); err == nil {
+		if fi.IsDir() {
+			return nil
+		}
+		return os.ErrExist
+	}
+	
+	// Create all parent directories
+	parts := strings.Split(strings.TrimSuffix(name, fs.separator), fs.separator)
+	currentPath := ""
+	
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		
+		if currentPath != "" {
+			currentPath += fs.separator
+		}
+		currentPath += part
+		
+		// Try to create directory, ignore if exists
+		if _, err := fs.Stat(currentPath); err != nil {
+			dirName := currentPath + fs.separator
+			if err := fs.createEmptyObject(dirName); err != nil {
+				return err
+			}
+		}
+	}
+	
+	return nil
+}
+
+// createEmptyObject creates an empty object to simulate a directory
+func (fs *Fs) createEmptyObject(name string) error {
+	opts := minio.PutObjectOptions{
+		ContentType: "application/x-directory",
+	}
+	_, err := fs.client.PutObject(fs.ctx, fs.bucket, name, strings.NewReader(""), 0, opts)
+	return err
 }
 
 func (fs *Fs) Open(name string) (afero.File, error) {
@@ -154,8 +237,57 @@ func (fs *Fs) Rename(oldName, newName string) error {
 func (fs *Fs) Stat(name string) (os.FileInfo, error) {
 	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
 
-	file := NewMinioFile(fs.ctx, fs, os.O_RDWR, defaultFileMode, name)
-	return file.Stat()
+	// Handle root directory
+	if name == "" || name == "." {
+		return &FileInfo{
+			name:     "",
+			size:     0,
+			updated:  time.Now(),
+			isDir:    true,
+			fileMode: defaultFileMode,
+		}, nil
+	}
+
+	// Try to stat as an object
+	stat, err := fs.client.StatObject(fs.ctx, fs.bucket, name, minio.StatObjectOptions{})
+	if err == nil {
+		return newFileInfoFromAttrs(stat, defaultFileMode), nil
+	}
+
+	// Try as directory (with trailing separator)
+	dirName := strings.TrimSuffix(name, fs.separator) + fs.separator
+	stat, err = fs.client.StatObject(fs.ctx, fs.bucket, dirName, minio.StatObjectOptions{})
+	if err == nil {
+		fi := newFileInfoFromAttrs(stat, defaultFileMode)
+		fi.isDir = true
+		if fi.size == 0 {
+			fi.size = folderSize
+		}
+		return fi, nil
+	}
+
+	// Check if it's a virtual directory (has children)
+	opts := minio.ListObjectsOptions{
+		Prefix:    dirName,
+		MaxKeys:   1,
+		Recursive: false,
+	}
+
+	for obj := range fs.client.ListObjects(fs.ctx, fs.bucket, opts) {
+		if obj.Err != nil {
+			return nil, obj.Err
+		}
+		// If we found any objects with this prefix, it's a virtual directory
+		return &FileInfo{
+			name:     name,
+			size:     folderSize,
+			updated:  time.Now(),
+			isDir:    true,
+			fileMode: defaultFileMode,
+		}, nil
+	}
+
+	return nil, os.ErrNotExist
 }
 
 func (fs *Fs) Chmod(_ string, _ os.FileMode) error {

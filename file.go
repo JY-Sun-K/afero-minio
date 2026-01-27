@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 
 	"github.com/minio/minio-go/v7"
@@ -119,7 +120,6 @@ func (o *MinioFile) Name() string {
 }
 
 func (o *MinioFile) readdirImpl(count int) ([]*FileInfo, error) {
-	var res []*FileInfo
 	err := o.Sync()
 	if err != nil {
 		return nil, err
@@ -128,32 +128,88 @@ func (o *MinioFile) readdirImpl(count int) ([]*FileInfo, error) {
 	var ownInfo os.FileInfo
 	ownInfo, err = o.Stat()
 	if err != nil {
-		return nil, err
-	}
-
-	if !ownInfo.IsDir() {
+		// If stat fails, try to list anyway (it might be root or virtual dir)
+		if o.resource.name != "" && o.resource.name != "." {
+			return nil, err
+		}
+	} else if !ownInfo.IsDir() {
 		return nil, syscall.ENOTDIR
 	}
 
-	//path := o.resource.fs.ensureTrailingSeparator(o.resource.name)
-
-	opts := minio.ListObjectsOptions{
-		Recursive: true,
-		Prefix:    o.resource.name,
+	// Ensure prefix ends with separator for proper directory listing
+	prefix := o.resource.name
+	if prefix != "" && !strings.HasSuffix(prefix, o.resource.fs.separator) {
+		prefix += o.resource.fs.separator
 	}
-	objs := o.resource.fs.client.ListObjects(o.resource.ctx, o.resource.fs.bucket, opts)
-	for obj := range objs {
-		tmp := newFileInfoFromAttrs(obj, o.resource.fileMode)
-		if tmp.Name() == "" {
-			// neither object.Name, not object.Prefix were present - so let's skip this unknown thing
+
+	// Use non-recursive listing to get only direct children
+	opts := minio.ListObjectsOptions{
+		Recursive: false,
+		Prefix:    prefix,
+	}
+
+	seen := make(map[string]bool)
+	var res []*FileInfo
+
+	for obj := range o.resource.fs.client.ListObjects(o.resource.ctx, o.resource.fs.bucket, opts) {
+		if obj.Err != nil {
+			return nil, obj.Err
+		}
+
+		// Skip the directory object itself
+		if obj.Key == prefix || obj.Key == strings.TrimSuffix(prefix, o.resource.fs.separator) {
 			continue
 		}
-		res = append(res, tmp)
+
+		// Extract the immediate child name
+		relativePath := strings.TrimPrefix(obj.Key, prefix)
+		if relativePath == "" {
+			continue
+		}
+
+		// For subdirectories, get only the first part
+		childName := relativePath
+		if idx := strings.Index(relativePath, o.resource.fs.separator); idx > 0 {
+			childName = relativePath[:idx]
+		}
+
+		// Avoid duplicates
+		if seen[childName] {
+			continue
+		}
+		seen[childName] = true
+
+		// Create FileInfo with full path for proper stat
+		fullPath := prefix + childName
+		isDir := strings.HasSuffix(obj.Key, o.resource.fs.separator) || 
+		         strings.Contains(strings.TrimPrefix(obj.Key, prefix), o.resource.fs.separator)
+		
+		fi := &FileInfo{
+			eTag:     obj.ETag,
+			name:     fullPath,
+			size:     obj.Size,
+			updated:  obj.LastModified,
+			isDir:    isDir,
+			fileMode: o.resource.fileMode,
+		}
+
+		if isDir && fi.size == 0 {
+			fi.size = folderSize
+		}
+
+		res = append(res, fi)
 	}
 
-	if count > 0 && len(res) > 0 {
-		sort.Sort(ByName(res))
+	// Sort results
+	sort.Sort(ByName(res))
+
+	// Apply count limit if specified
+	if count > 0 && len(res) > count {
 		res = res[:count]
+	}
+
+	if len(res) == 0 {
+		return res, io.EOF
 	}
 
 	return res, nil
@@ -191,12 +247,7 @@ func (o *MinioFile) Stat() (os.FileInfo, error) {
 		return nil, err
 	}
 
-	stat, err := o.resource.fs.client.StatObject(o.resource.ctx, o.resource.fs.bucket, o.resource.name, minio.StatObjectOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	return newFileInfoFromAttrs(stat, o.resource.fileMode), nil
+	return o.resource.fs.Stat(o.resource.name)
 }
 
 func (o *MinioFile) Sync() error {

@@ -89,12 +89,8 @@ func (o *minioFileResource) ReadAt(p []byte, off int64) (n int, err error) {
 		return 0, nil
 	}
 
-	// Assume that if the reader is open; it is at the correct offset
-	// a good performance assumption that we must ensure holds
-	if off == o.offset && o.reader != nil {
-		n, err = o.reader.ReadAt(p, off)
-		o.offset += int64(n)
-		return n, err
+	if off < 0 {
+		return 0, ErrOutOfRange
 	}
 
 	// If any writers have written anything; commit it first so we can read it back.
@@ -107,56 +103,153 @@ func (o *minioFileResource) ReadAt(p []byte, off int64) (n int, err error) {
 	if err != nil {
 		return 0, err
 	}
-	o.reader = r
-	o.offset = off
+	defer func() {
+		if closeErr := r.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
-	read, err := r.ReadAt(p, off)
-	o.offset += int64(read)
-	return read, err
-}
-
-func (o *minioFileResource) WriteAt(b []byte, off int64) (n int, err error) {
-	// If the writer is opened and at the correct offset we're good!
-	if off == o.offset && o.writer != nil {
-		n, err = o.writer.Write(b)
-		o.offset += int64(n)
-		return n, err
-	}
-
-	// Ensure readers must be re-opened and that if a writer is active at another
-	// offset it is first committed before we do a "seek" below
-	if err = o.maybeCloseIo(); err != nil {
-		return 0, err
-	}
-
-	// WriteAt to a non existing file
-	if off > o.currentIoSize {
-		return 0, ErrOutOfRange
-	}
-	o.offset = off
-	//o.writer =
-
-	// byt buffer
-	buffer := bytes.NewReader(b)
-	// minio
-	opts := minio.PutObjectOptions{
-		ContentType: http.DetectContentType(b),
-	}
-	if off > 0 {
-		opts.PartSize = uint64(off)
-		opts.NumThreads = 8
-		opts.ConcurrentStreamParts = false
-		opts.DisableMultipart = true
-	}
-	_, err = o.fs.client.PutObject(o.ctx, o.fs.bucket, o.name, buffer, buffer.Size(), opts)
+	// Get object info to check size
+	stat, err := r.Stat()
 	if err != nil {
 		return 0, err
 	}
 
-	o.offset += int64(buffer.Len())
-	return buffer.Len(), nil
+	// Update current size
+	o.currentIoSize = stat.Size
+
+	// If offset is beyond file size, return EOF
+	if off >= stat.Size {
+		return 0, io.EOF
+	}
+
+	// Read at offset
+	read, err := r.ReadAt(p, off)
+	o.offset = off + int64(read)
+	return read, err
 }
 
-func (o *minioFileResource) Truncate(_ int64) error {
-	return ErrNotSupported
+func (o *minioFileResource) WriteAt(b []byte, off int64) (n int, err error) {
+	// Ensure readers must be closed before writing
+	if err = o.maybeCloseIo(); err != nil {
+		return 0, err
+	}
+
+	// For MinIO, we need to handle writes carefully
+	// If writing at offset 0 or to a new file, we can directly upload
+	if off == 0 || o.currentIoSize == 0 {
+		buffer := bytes.NewReader(b)
+		opts := minio.PutObjectOptions{
+			ContentType: http.DetectContentType(b),
+		}
+		_, err = o.fs.client.PutObject(o.ctx, o.fs.bucket, o.name, buffer, int64(len(b)), opts)
+		if err != nil {
+			return 0, err
+		}
+		o.offset = int64(len(b))
+		o.currentIoSize = int64(len(b))
+		return len(b), nil
+	}
+
+	// For writes at non-zero offsets, we need to read existing content,
+	// modify it, and write back (MinIO doesn't support partial updates)
+	var existingData []byte
+	if o.currentIoSize > 0 {
+		// Read existing file content
+		opts := minio.GetObjectOptions{}
+		reader, err := o.fs.client.GetObject(o.ctx, o.fs.bucket, o.name, opts)
+		if err != nil {
+			return 0, err
+		}
+		defer reader.Close()
+		
+		existingData, err = io.ReadAll(reader)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	// Expand buffer if necessary
+	newSize := off + int64(len(b))
+	if int64(len(existingData)) < newSize {
+		newData := make([]byte, newSize)
+		copy(newData, existingData)
+		existingData = newData
+	}
+
+	// Write new data at offset
+	copy(existingData[off:], b)
+
+	// Upload modified content
+	buffer := bytes.NewReader(existingData)
+	opts := minio.PutObjectOptions{
+		ContentType: http.DetectContentType(existingData),
+	}
+	_, err = o.fs.client.PutObject(o.ctx, o.fs.bucket, o.name, buffer, int64(len(existingData)), opts)
+	if err != nil {
+		return 0, err
+	}
+
+	o.offset = off + int64(len(b))
+	o.currentIoSize = int64(len(existingData))
+	return len(b), nil
+}
+
+func (o *minioFileResource) Truncate(size int64) error {
+	// Close any open readers/writers
+	if err := o.maybeCloseIo(); err != nil {
+		return err
+	}
+
+	if size < 0 {
+		return ErrOutOfRange
+	}
+
+	// If truncating to 0, just create empty file
+	if size == 0 {
+		opts := minio.PutObjectOptions{}
+		_, err := o.fs.client.PutObject(o.ctx, o.fs.bucket, o.name, bytes.NewReader([]byte{}), 0, opts)
+		if err != nil {
+			return err
+		}
+		o.currentIoSize = 0
+		o.offset = 0
+		return nil
+	}
+
+	// Read current content
+	opts := minio.GetObjectOptions{}
+	reader, err := o.fs.client.GetObject(o.ctx, o.fs.bucket, o.name, opts)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	existingData, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+
+	var newData []byte
+	if int64(len(existingData)) > size {
+		// Truncate to smaller size
+		newData = existingData[:size]
+	} else if int64(len(existingData)) < size {
+		// Expand with zeros
+		newData = make([]byte, size)
+		copy(newData, existingData)
+	} else {
+		// Same size, no change needed
+		return nil
+	}
+
+	// Upload truncated/expanded content
+	putOpts := minio.PutObjectOptions{}
+	_, err = o.fs.client.PutObject(o.ctx, o.fs.bucket, o.name, bytes.NewReader(newData), int64(len(newData)), putOpts)
+	if err != nil {
+		return err
+	}
+
+	o.currentIoSize = size
+	return nil
 }
