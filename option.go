@@ -27,9 +27,9 @@ func ParseURL(minioURL string) (*minio.Options, error) {
 	}
 
 	// Validate scheme
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, fmt.Errorf("miniofs: invalid scheme %q, must be http or https", u.Scheme)
-	}
+	// if u.Scheme != "http" && u.Scheme != "https" {
+	// 	return nil, fmt.Errorf("miniofs: invalid scheme %q, must be http or https", u.Scheme)
+	// }
 
 	// Validate host
 	if u.Host == "" {

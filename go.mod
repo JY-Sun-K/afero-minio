@@ -1,6 +1,6 @@
 module github.com/JY-Sun-K/afero-minio
 
-go 1.25.6
+go 1.25.5
 
 require (
 	github.com/minio/minio-go/v7 v7.0.90
