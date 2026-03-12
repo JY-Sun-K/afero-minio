@@ -300,11 +300,11 @@ func (fs *Fs) Rename(oldName, newName string) error {
 	if _, err := fs.Stat(oldName); err != nil {
 		return NewPathError("rename", oldName, os.ErrNotExist)
 	}
-
+	// 这个其实没有必要，因为 MinIO 的 CopyObject 会覆盖目标对象，如果目标对象不存在则会创建一个新的对象。
 	// Check if destination already exists
-	if _, err := fs.Stat(newName); err == nil {
-		return NewPathError("rename", newName, os.ErrExist)
-	}
+	// if _, err := fs.Stat(newName); err == nil {
+	// 	return NewPathError("rename", newName, os.ErrExist)
+	// }
 
 	// Copy object
 	src := minio.CopySrcOptions{
