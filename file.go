@@ -250,6 +250,10 @@ func (o *MinioFile) readdirImpl(count int) ([]*FileInfo, error) {
 func (o *MinioFile) Readdir(count int) ([]os.FileInfo, error) {
 	fi, err := o.readdirImpl(count)
 	if err != nil {
+		// 【关键修复】：如果错误是 EOF，说明目录为空，返回空列表而不是错误
+		if err == io.EOF {
+			return []os.FileInfo{}, nil
+		}
 		return nil, err
 	}
 
