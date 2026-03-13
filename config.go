@@ -11,6 +11,7 @@ import (
 
 const defaultMaxDirectObjectSize int64 = 16 << 20
 const minComposePartSize int64 = 5 << 20
+const defaultStreamChunkSize uint64 = 5 << 20
 
 type WriteStrategy string
 
@@ -54,6 +55,7 @@ type Options struct {
 	AppendStrategy              AppendStrategy
 	AssumeNativeAppendSupported bool
 	NativeAppendChunkSize       uint64
+	StreamChunkSize             uint64
 }
 
 func DefaultOptions() Options {
@@ -63,6 +65,7 @@ func DefaultOptions() Options {
 		MaxDirectObjectSize: defaultMaxDirectObjectSize,
 		LargeObjectStrategy: LargeObjectStrategyError,
 		AppendStrategy:      AppendStrategyCompat,
+		StreamChunkSize:     defaultStreamChunkSize,
 	}
 }
 
@@ -83,6 +86,12 @@ func (o Options) withDefaults() Options {
 	}
 	if o.AppendStrategy == "" {
 		o.AppendStrategy = defaults.AppendStrategy
+	}
+	switch {
+	case o.StreamChunkSize == 0:
+		o.StreamChunkSize = defaults.StreamChunkSize
+	case o.StreamChunkSize < defaultStreamChunkSize:
+		o.StreamChunkSize = defaultStreamChunkSize
 	}
 	if shouldDefaultDirectoryMarkers(o) {
 		o.DirectoryMarkers = defaults.DirectoryMarkers
@@ -109,7 +118,8 @@ func shouldDefaultDirectoryMarkers(o Options) bool {
 		o.TempDir == "" &&
 		o.AppendStrategy == "" &&
 		!o.AssumeNativeAppendSupported &&
-		o.NativeAppendChunkSize == 0
+		o.NativeAppendChunkSize == 0 &&
+		o.StreamChunkSize == 0
 }
 
 func normalizePrefix(prefix string) string {
@@ -127,11 +137,12 @@ const (
 )
 
 type writePlan struct {
-	options      Options
-	currentSize  int64
-	targetOffset int64
-	writeLen     int
-	appendOnly   bool
+	options           Options
+	currentSize       int64
+	targetOffset      int64
+	writeLen          int
+	appendOnly        bool
+	nativeAppendReady bool
 }
 
 func selectWriteStrategy(plan writePlan) (writeMode, error) {
@@ -143,6 +154,21 @@ func selectWriteStrategy(plan writePlan) (writeMode, error) {
 
 	if plan.currentSize == 0 && plan.targetOffset == 0 {
 		return writeModeDirect, nil
+	}
+
+	if (plan.targetOffset == plan.currentSize || plan.appendOnly) &&
+		opts.AppendStrategy == AppendStrategyNative &&
+		opts.AssumeNativeAppendSupported {
+		if plan.nativeAppendReady {
+			return writeModeNativeAppend, nil
+		}
+		if plan.currentSize < minComposePartSize {
+			if opts.LargeObjectStrategy == LargeObjectStrategyTempFile {
+				return writeModeTempFile, nil
+			}
+			return "", ErrLargeWriteRequiresStaging
+		}
+		return writeModeComposeAppend, nil
 	}
 
 	newEnd := plan.targetOffset + int64(plan.writeLen)
@@ -189,4 +215,13 @@ func selectWriteStrategy(plan writePlan) (writeMode, error) {
 	default:
 		return "", ErrLargeWriteRequiresStaging
 	}
+}
+
+func (o Options) readFromChunkSize() int {
+	opts := o.withDefaults()
+	size := opts.StreamChunkSize
+	if opts.NativeAppendChunkSize > 0 && opts.NativeAppendChunkSize < size {
+		size = opts.NativeAppendChunkSize
+	}
+	return int(size)
 }

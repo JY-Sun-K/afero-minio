@@ -97,6 +97,8 @@ func NewFsWithOptions(ctx context.Context, client *minio.Client, bucket string, 
 }
 
 func applyOptionsToMinioClient(dst *minio.Options, opts Options) {
+	opts = opts.withDefaults()
+
 	if opts.Transport != nil {
 		dst.Transport = opts.Transport
 	}
@@ -105,6 +107,9 @@ func applyOptionsToMinioClient(dst *minio.Options, opts Options) {
 	}
 	if opts.BucketLookup != 0 {
 		dst.BucketLookup = opts.BucketLookup
+	}
+	if opts.AppendStrategy == AppendStrategyNative && opts.AssumeNativeAppendSupported {
+		dst.TrailingHeaders = true
 	}
 }
 
@@ -505,10 +510,14 @@ func (fs *Fs) listObjects(prefix string, recursive bool, maxKeys int) (<-chan mi
 }
 
 func (fs *Fs) statObjectByKey(key string) (minio.ObjectInfo, error) {
+	return fs.statObjectByKeyWithOptions(key, minio.StatObjectOptions{})
+}
+
+func (fs *Fs) statObjectByKeyWithOptions(key string, opts minio.StatObjectOptions) (minio.ObjectInfo, error) {
 	opCtx, cancel := fs.operationContext()
 	defer cancel()
 
-	info, err := fs.client.StatObject(opCtx, fs.bucket, key, minio.StatObjectOptions{})
+	info, err := fs.client.StatObject(opCtx, fs.bucket, key, opts)
 	if err != nil {
 		return minio.ObjectInfo{}, mapMinioError(err)
 	}
@@ -645,7 +654,7 @@ func (fs *Fs) appendObject(name string, reader io.Reader, size int64) error {
 	defer cancel()
 
 	opts := minio.AppendObjectOptions{}
-	if fs.options.NativeAppendChunkSize > 0 {
+	if fs.options.NativeAppendChunkSize > 0 && size > int64(fs.options.NativeAppendChunkSize) {
 		opts.ChunkSize = fs.options.NativeAppendChunkSize
 	}
 	_, err := fs.client.AppendObject(opCtx, fs.bucket, fs.objectKey(name), reader, size, opts)

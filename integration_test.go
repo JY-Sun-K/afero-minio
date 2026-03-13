@@ -34,6 +34,23 @@ func getIntegrationFsWithOptions(t *testing.T, opts Options) afero.Fs {
 	return fs
 }
 
+func requireNativeAppendIntegration(t *testing.T) {
+	t.Helper()
+	if os.Getenv("MINIOFS_TEST_NATIVE_APPEND") == "" {
+		t.Skip("MINIOFS_TEST_NATIVE_APPEND is not set")
+	}
+}
+
+func nativeAppendIntegrationOptions() Options {
+	opts := DefaultOptions()
+	opts.MaxDirectObjectSize = 8 << 20
+	opts.AppendStrategy = AppendStrategyNative
+	opts.AssumeNativeAppendSupported = true
+	opts.StreamChunkSize = uint64(minComposePartSize)
+	opts.NativeAppendChunkSize = uint64(minComposePartSize)
+	return opts
+}
+
 func TestIntegrationCreateEmptyObject(t *testing.T) {
 	fs := getIntegrationFs(t)
 	const name = "integration-empty-object.txt"
@@ -361,16 +378,9 @@ func TestIntegrationConcurrentHandlesObserveSyncedWrites(t *testing.T) {
 }
 
 func TestIntegrationAppendNativeOptIn(t *testing.T) {
-	if os.Getenv("MINIOFS_TEST_NATIVE_APPEND") == "" {
-		t.Skip("MINIOFS_TEST_NATIVE_APPEND is not set")
-	}
+	requireNativeAppendIntegration(t)
 
-	opts := DefaultOptions()
-	opts.AppendStrategy = AppendStrategyNative
-	opts.AssumeNativeAppendSupported = true
-	opts.NativeAppendChunkSize = uint64(minComposePartSize)
-
-	fs := getIntegrationFsWithOptions(t, opts)
+	fs := getIntegrationFsWithOptions(t, nativeAppendIntegrationOptions())
 	const name = "integration-append-native.txt"
 
 	t.Cleanup(func() {
@@ -390,5 +400,99 @@ func TestIntegrationAppendNativeOptIn(t *testing.T) {
 	}
 	if err := f.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
+	}
+}
+
+func TestIntegrationCopyToEmptyObjectUsesReadFrom(t *testing.T) {
+	requireNativeAppendIntegration(t)
+
+	fs := getIntegrationFsWithOptions(t, nativeAppendIntegrationOptions())
+	const name = "integration-copy-empty-native.txt"
+
+	t.Cleanup(func() {
+		_ = fs.Remove(name)
+	})
+
+	f, err := fs.OpenFile(name, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	src := &chunkedLiteralReader{
+		remaining: 13 << 20,
+		chunkSize: 32 << 10,
+		fill:      'a',
+	}
+	n, err := io.Copy(f, src)
+	if err != nil {
+		t.Fatalf("io.Copy failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if n != 13<<20 {
+		t.Fatalf("expected to copy 13 MiB, got %d", n)
+	}
+
+	data, err := afero.ReadFile(fs, name)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if len(data) != 13<<20 {
+		t.Fatalf("unexpected object size %d", len(data))
+	}
+	if data[0] != 'a' || data[len(data)-1] != 'a' {
+		t.Fatalf("unexpected object boundaries %q...%q", data[:1], data[len(data)-1:])
+	}
+}
+
+func TestIntegrationCopyAtEOFPrefersNativeAppend(t *testing.T) {
+	requireNativeAppendIntegration(t)
+
+	fs := getIntegrationFsWithOptions(t, nativeAppendIntegrationOptions())
+	const name = "integration-copy-append-native.txt"
+	initial := strings.Repeat("n", 6<<20)
+
+	t.Cleanup(func() {
+		_ = fs.Remove(name)
+	})
+
+	if err := afero.WriteFile(fs, name, []byte(initial), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	f, err := fs.OpenFile(name, os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if _, err := f.Seek(int64(len(initial)), io.SeekStart); err != nil {
+		t.Fatalf("Seek failed: %v", err)
+	}
+
+	src := &chunkedLiteralReader{
+		remaining: 1 << 20,
+		chunkSize: 32 << 10,
+		fill:      't',
+	}
+	n, err := io.Copy(f, src)
+	if err != nil {
+		t.Fatalf("io.Copy failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if n != 1<<20 {
+		t.Fatalf("expected to copy 1 MiB, got %d", n)
+	}
+
+	data, err := afero.ReadFile(fs, name)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if len(data) != len(initial)+(1<<20) {
+		t.Fatalf("unexpected appended size %d", len(data))
+	}
+	if data[0] != 'n' || data[len(initial)] != 't' || data[len(data)-1] != 't' {
+		t.Fatalf("unexpected append boundaries %q %q %q", data[:1], data[len(initial):len(initial)+1], data[len(data)-1:])
 	}
 }

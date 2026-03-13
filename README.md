@@ -118,6 +118,28 @@ func main() {
 }
 ```
 
+#### Append-Throughput Profile (Pure MinIO)
+
+```go
+opts := miniofs.DefaultOptions()
+opts.MaxDirectObjectSize = 8 << 20
+opts.LargeObjectStrategy = miniofs.LargeObjectStrategyTempFile
+opts.AppendStrategy = miniofs.AppendStrategyNative
+opts.AssumeNativeAppendSupported = true
+opts.StreamChunkSize = 5 << 20
+opts.NativeAppendChunkSize = 5 << 20
+
+fs, err := miniofs.NewMinioFsWithOptions(context.Background(), dsn, opts)
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+- `StreamChunkSize` only affects `MinioFile.ReadFrom`, so `io.Copy(file, src)` now batches reads into larger writes automatically
+- With `AppendStrategyNative` and `AssumeNativeAppendSupported=true`, sequential writes at EOF prefer native append before the small-object direct rewrite branch
+- `LargeObjectStrategyTempFile` remains the fallback for non-sequential large writes
+- If you build your own `minio.Client` and call `NewFs`, enable `TrailingHeaders: true` on the client when opting into native append
+
 ### Usage Examples
 
 #### File Operations
@@ -411,6 +433,28 @@ func main() {
     }
 }
 ```
+
+#### 纯 MinIO 的追加吞吐型配置
+
+```go
+opts := miniofs.DefaultOptions()
+opts.MaxDirectObjectSize = 8 << 20
+opts.LargeObjectStrategy = miniofs.LargeObjectStrategyTempFile
+opts.AppendStrategy = miniofs.AppendStrategyNative
+opts.AssumeNativeAppendSupported = true
+opts.StreamChunkSize = 5 << 20
+opts.NativeAppendChunkSize = 5 << 20
+
+fs, err := miniofs.NewMinioFsWithOptions(context.Background(), dsn, opts)
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+- `StreamChunkSize` 只影响 `MinioFile.ReadFrom`，所以 `io.Copy(file, src)` 会自动聚合成更大的写入块
+- 在 `AppendStrategyNative` 且 `AssumeNativeAppendSupported=true` 时，顺序写到 EOF 会优先走 native append，而不是先落到小对象 direct rewrite
+- 非顺序的大对象写入仍然由 `LargeObjectStrategyTempFile` 兜底
+- 如果你自行创建 `minio.Client` 再调用 `NewFs`，启用 native append 时需要同时把客户端的 `TrailingHeaders` 打开
 
 ### 使用示例
 

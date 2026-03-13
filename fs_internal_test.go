@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,8 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/spf13/afero"
 )
+
+var _ io.ReaderFrom = (*MinioFile)(nil)
 
 func TestReadFileUsesLiveGetObjectContext(t *testing.T) {
 	transport := newFakeS3Transport()
@@ -164,16 +167,159 @@ func TestRemoveDoesNotSendGovernanceBypassByDefault(t *testing.T) {
 	}
 }
 
+func TestCopyUsesReadFromToAggregateSequentialWrites(t *testing.T) {
+	transport := newFakeS3Transport()
+
+	opts := DefaultOptions()
+	opts.MaxDirectObjectSize = 8 << 20
+	opts.AppendStrategy = AppendStrategyNative
+	opts.AssumeNativeAppendSupported = true
+	opts.StreamChunkSize = 5 << 20
+
+	fs := newFakeTransportFs(t, context.Background(), transport, opts)
+
+	f, err := fs.OpenFile("stream.bin", os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	transport.resetCounts()
+
+	src := &chunkedLiteralReader{
+		remaining: 13 << 20,
+		chunkSize: 32 << 10,
+		fill:      'a',
+	}
+	n, err := io.Copy(f, src)
+	if err != nil {
+		t.Fatalf("io.Copy failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if n != 13<<20 {
+		t.Fatalf("expected to copy 13 MiB, got %d", n)
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.puts != 1 {
+		t.Fatalf("expected single initial put, got %+v", stats)
+	}
+	if stats.appends != 2 {
+		t.Fatalf("expected two append requests, got %+v", stats)
+	}
+	if stats.gets != 0 {
+		t.Fatalf("expected no object rewrite reads, got %+v", stats)
+	}
+}
+
+func TestCopyAtEOFPrefersNativeAppendOverDirectRewrite(t *testing.T) {
+	transport := newFakeS3Transport()
+
+	opts := DefaultOptions()
+	opts.MaxDirectObjectSize = 8 << 20
+	opts.AppendStrategy = AppendStrategyNative
+	opts.AssumeNativeAppendSupported = true
+	opts.StreamChunkSize = 5 << 20
+
+	fs := newFakeTransportFs(t, context.Background(), transport, opts)
+
+	initial := bytes.Repeat([]byte("n"), 6<<20)
+	if err := afero.WriteFile(fs, "append.bin", initial, 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	transport.resetCounts()
+
+	f, err := fs.OpenFile("append.bin", os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if _, err := f.Seek(int64(len(initial)), io.SeekStart); err != nil {
+		t.Fatalf("Seek failed: %v", err)
+	}
+
+	src := &chunkedLiteralReader{
+		remaining: 1 << 20,
+		chunkSize: 32 << 10,
+		fill:      't',
+	}
+	n, err := io.Copy(f, src)
+	if err != nil {
+		t.Fatalf("io.Copy failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if n != 1<<20 {
+		t.Fatalf("expected to copy 1 MiB, got %d", n)
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.puts != 0 {
+		t.Fatalf("expected no direct rewrite put, got %+v", stats)
+	}
+	if stats.appends != 1 {
+		t.Fatalf("expected single native append request, got %+v", stats)
+	}
+	if stats.gets != 0 {
+		t.Fatalf("expected no readback for append, got %+v", stats)
+	}
+}
+
+func TestCopyAtNonEOFUsesCompatibleWritePath(t *testing.T) {
+	transport := newFakeS3Transport()
+
+	opts := DefaultOptions()
+	opts.MaxDirectObjectSize = 4
+	opts.LargeObjectStrategy = LargeObjectStrategyTempFile
+	opts.StreamChunkSize = 5 << 20
+
+	fs := newFakeTransportFs(t, context.Background(), transport, opts)
+
+	if err := afero.WriteFile(fs, "mutate.bin", []byte("abcdefgh"), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	f, err := fs.OpenFile("mutate.bin", os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if _, err := f.Seek(1, io.SeekStart); err != nil {
+		t.Fatalf("Seek failed: %v", err)
+	}
+
+	src := &chunkedByteSliceReader{
+		data:      []byte("ZZZ"),
+		chunkSize: 1,
+	}
+	if _, err := io.Copy(f, src); err != nil {
+		t.Fatalf("io.Copy failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	data, err := afero.ReadFile(fs, "mutate.bin")
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if string(data) != "aZZZefgh" {
+		t.Fatalf("unexpected mutated data %q", string(data))
+	}
+}
+
 func newFakeTransportFs(t *testing.T, ctx context.Context, transport http.RoundTripper, opts Options) *Fs {
 	t.Helper()
 
-	client, err := minio.New("fake.minio.local", &minio.Options{
+	minioOpts := &minio.Options{
 		Creds:        credentials.NewStaticV4("test-access", "test-secret", ""),
 		Secure:       false,
 		Region:       "us-east-1",
 		BucketLookup: minio.BucketLookupPath,
 		Transport:    transport,
-	})
+	}
+	applyOptionsToMinioClient(minioOpts, opts)
+
+	client, err := minio.New("fake.minio.local", minioOpts)
 	if err != nil {
 		t.Fatalf("minio.New failed: %v", err)
 	}
@@ -191,6 +337,10 @@ type fakeS3Transport struct {
 	putStatus                 int
 	lastDeleteHeaders         http.Header
 	blockListUntilContextDone bool
+	putCount                  int
+	appendCount               int
+	getCount                  int
+	headCount                 int
 }
 
 func newFakeS3Transport() *fakeS3Transport {
@@ -231,17 +381,14 @@ func (t *fakeS3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	switch req.Method {
 	case http.MethodHead:
+		t.incrementHeadCount()
 		data, ok := t.getObject(bucket, key)
 		if !ok {
 			return fakeErrorResponse(req, http.StatusNotFound, "NoSuchKey"), nil
 		}
-		return fakeHTTPResponse(req, http.StatusOK, "", map[string]string{
-			"Content-Length": fmt.Sprintf("%d", len(data)),
-			"Content-Type":   "application/octet-stream",
-			"ETag":           `"etag"`,
-			"Last-Modified":  time.Unix(0, 0).UTC().Format(http.TimeFormat),
-		}), nil
+		return fakeHTTPResponse(req, http.StatusOK, "", fakeObjectHeaders(len(data))), nil
 	case http.MethodGet:
+		t.incrementGetCount()
 		data, ok := t.getObject(bucket, key)
 		if !ok {
 			return fakeErrorResponse(req, http.StatusNotFound, "NoSuchKey"), nil
@@ -250,17 +397,30 @@ func (t *fakeS3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			return nil, err
 		}
-		headers["ETag"] = `"etag"`
-		headers["Last-Modified"] = time.Unix(0, 0).UTC().Format(http.TimeFormat)
+		for k, v := range fakeObjectHeaders(len(data)) {
+			headers[k] = v
+		}
+		headers["Content-Length"] = fmt.Sprintf("%d", len(body))
 		return fakeHTTPResponse(req, status, string(body), headers), nil
 	case http.MethodPut:
 		if t.putStatus != 0 {
 			return fakeErrorResponse(req, t.putStatus, "InternalError"), nil
 		}
-		payload, err := io.ReadAll(req.Body)
+		payload, err := readRequestPayload(req)
 		if err != nil {
 			return nil, err
 		}
+		if offsetHeader := req.Header.Get("X-Amz-Write-Offset-Bytes"); offsetHeader != "" {
+			size, err := t.appendObject(bucket, key, offsetHeader, payload)
+			if err != nil {
+				return nil, err
+			}
+			return fakeHTTPResponse(req, http.StatusOK, "", map[string]string{
+				"ETag":              `"etag"`,
+				"x-amz-object-size": fmt.Sprintf("%d", size),
+			}), nil
+		}
+		t.incrementPutCount()
 		t.setObject(bucket, key, payload)
 		return fakeHTTPResponse(req, http.StatusOK, "", map[string]string{
 			"ETag": `"etag"`,
@@ -272,6 +432,26 @@ func (t *fakeS3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	default:
 		return fakeErrorResponse(req, http.StatusNotImplemented, "NotImplemented"), nil
 	}
+}
+
+func (t *fakeS3Transport) appendObject(bucket, key, offsetHeader string, payload []byte) (int, error) {
+	offset, err := strconv.ParseInt(offsetHeader, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	fullKey := bucket + "/" + key
+	current := append([]byte(nil), t.objects[fullKey]...)
+	if int64(len(current)) != offset {
+		return 0, fmt.Errorf("unexpected append offset %d for %s with size %d", offset, key, len(current))
+	}
+	t.appendCount++
+	current = append(current, payload...)
+	t.objects[fullKey] = current
+	return len(current), nil
 }
 
 func (t *fakeS3Transport) getObject(bucket, key string) ([]byte, bool) {
@@ -296,6 +476,98 @@ func (t *fakeS3Transport) recordDeleteHeaders(header http.Header) {
 	t.lastDeleteHeaders = header.Clone()
 }
 
+func (t *fakeS3Transport) incrementPutCount() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.putCount++
+}
+
+func (t *fakeS3Transport) incrementGetCount() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.getCount++
+}
+
+func (t *fakeS3Transport) incrementHeadCount() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.headCount++
+}
+
+func (t *fakeS3Transport) resetCounts() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.putCount = 0
+	t.appendCount = 0
+	t.getCount = 0
+	t.headCount = 0
+}
+
+type requestCounts struct {
+	puts    int
+	appends int
+	gets    int
+	heads   int
+}
+
+func (t *fakeS3Transport) snapshotCounts() requestCounts {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return requestCounts{
+		puts:    t.putCount,
+		appends: t.appendCount,
+		gets:    t.getCount,
+		heads:   t.headCount,
+	}
+}
+
+type chunkedLiteralReader struct {
+	remaining int64
+	chunkSize int
+	fill      byte
+}
+
+func (r *chunkedLiteralReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if n > r.chunkSize {
+		n = r.chunkSize
+	}
+	if int64(n) > r.remaining {
+		n = int(r.remaining)
+	}
+	for i := 0; i < n; i++ {
+		p[i] = r.fill
+	}
+	r.remaining -= int64(n)
+	return n, nil
+}
+
+type chunkedByteSliceReader struct {
+	data      []byte
+	offset    int
+	chunkSize int
+}
+
+func (r *chunkedByteSliceReader) Read(p []byte) (int, error) {
+	if r.offset >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if n > r.chunkSize {
+		n = r.chunkSize
+	}
+	remaining := len(r.data) - r.offset
+	if n > remaining {
+		n = remaining
+	}
+	copy(p[:n], r.data[r.offset:r.offset+n])
+	r.offset += n
+	return n, nil
+}
+
 func splitBucketAndKey(path string) (string, string) {
 	path = strings.TrimPrefix(path, "/")
 	if path == "" {
@@ -306,6 +578,67 @@ func splitBucketAndKey(path string) (string, string) {
 		return parts[0], ""
 	}
 	return parts[0], parts[1]
+}
+
+func fakeObjectHeaders(size int) map[string]string {
+	return map[string]string{
+		"Content-Length":        fmt.Sprintf("%d", size),
+		"Content-Type":          "application/octet-stream",
+		"ETag":                  `"etag"`,
+		"Last-Modified":         time.Unix(0, 0).UTC().Format(http.TimeFormat),
+		"X-Amz-Checksum-Crc32c": "AAAAAA==",
+		"X-Amz-Checksum-Type":   minio.ChecksumFullObjectMode.String(),
+	}
+}
+
+func readRequestPayload(req *http.Request) ([]byte, error) {
+	payload, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	if req.Header.Get("X-Amz-Decoded-Content-Length") == "" &&
+		!strings.Contains(strings.ToLower(req.Header.Get("Content-Encoding")), "aws-chunked") {
+		return payload, nil
+	}
+	return decodeAWSChunkedPayload(payload)
+}
+
+func decodeAWSChunkedPayload(payload []byte) ([]byte, error) {
+	rest := payload
+	decoded := make([]byte, 0, len(payload))
+
+	for {
+		lineEnd := bytes.Index(rest, []byte("\r\n"))
+		if lineEnd < 0 {
+			return nil, fmt.Errorf("invalid aws-chunked payload: missing chunk header terminator")
+		}
+
+		header := string(rest[:lineEnd])
+		rest = rest[lineEnd+2:]
+
+		sizeField := header
+		if idx := strings.IndexByte(sizeField, ';'); idx >= 0 {
+			sizeField = sizeField[:idx]
+		}
+
+		size, err := strconv.ParseInt(strings.TrimSpace(sizeField), 16, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid aws-chunked payload: %w", err)
+		}
+		if size == 0 {
+			return decoded, nil
+		}
+		if int64(len(rest)) < size+2 {
+			return nil, fmt.Errorf("invalid aws-chunked payload: short chunk body")
+		}
+
+		decoded = append(decoded, rest[:size]...)
+		rest = rest[size:]
+		if len(rest) < 2 || rest[0] != '\r' || rest[1] != '\n' {
+			return nil, fmt.Errorf("invalid aws-chunked payload: missing chunk terminator")
+		}
+		rest = rest[2:]
+	}
 }
 
 func (t *fakeS3Transport) listBucketV2Result(bucket, prefix, delimiter string) string {

@@ -27,6 +27,10 @@ func TestDefaultOptions(t *testing.T) {
 	if opts.MaxDirectObjectSize <= 0 {
 		t.Fatalf("expected positive MaxDirectObjectSize, got %d", opts.MaxDirectObjectSize)
 	}
+
+	if opts.StreamChunkSize != 5<<20 {
+		t.Fatalf("expected default stream chunk size 5 MiB, got %d", opts.StreamChunkSize)
+	}
 }
 
 func TestOptionsWithDefaults(t *testing.T) {
@@ -47,6 +51,10 @@ func TestOptionsWithDefaults(t *testing.T) {
 	if opts.MaxDirectObjectSize != DefaultOptions().MaxDirectObjectSize {
 		t.Fatalf("expected default MaxDirectObjectSize, got %d", opts.MaxDirectObjectSize)
 	}
+
+	if opts.StreamChunkSize != DefaultOptions().StreamChunkSize {
+		t.Fatalf("expected default StreamChunkSize, got %d", opts.StreamChunkSize)
+	}
 }
 
 func TestOptionsWithDefaultsPreservesExplicitDirectoryMarkersFalse(t *testing.T) {
@@ -57,6 +65,17 @@ func TestOptionsWithDefaultsPreservesExplicitDirectoryMarkersFalse(t *testing.T)
 
 	if opts.DirectoryMarkers {
 		t.Fatal("expected explicit DirectoryMarkers=false to be preserved")
+	}
+}
+
+func TestOptionsWithDefaultsNormalizesStreamChunkSize(t *testing.T) {
+	opts := DefaultOptions()
+	opts.StreamChunkSize = 1 << 20
+
+	opts = opts.withDefaults()
+
+	if opts.StreamChunkSize != 5<<20 {
+		t.Fatalf("expected StreamChunkSize to normalize to 5 MiB, got %d", opts.StreamChunkSize)
 	}
 }
 
@@ -104,6 +123,62 @@ func TestSelectWriteStrategy(t *testing.T) {
 	}
 	if mode != writeModeTempFile {
 		t.Fatalf("expected temp file mode, got %q", mode)
+	}
+}
+
+func TestSelectWriteStrategyPrefersNativeAppendForSequentialWrite(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MaxDirectObjectSize = 8 << 20
+	opts.AppendStrategy = AppendStrategyNative
+	opts.AssumeNativeAppendSupported = true
+
+	mode, err := selectWriteStrategy(writePlan{
+		options:           opts,
+		currentSize:       6 << 20,
+		targetOffset:      6 << 20,
+		writeLen:          1 << 20,
+		nativeAppendReady: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != writeModeNativeAppend {
+		t.Fatalf("expected native append mode, got %q", mode)
+	}
+}
+
+func TestSelectWriteStrategyFallsBackWhenNativeAppendIsNotReady(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MaxDirectObjectSize = 8 << 20
+	opts.AppendStrategy = AppendStrategyNative
+	opts.AssumeNativeAppendSupported = true
+	opts.LargeObjectStrategy = LargeObjectStrategyTempFile
+
+	mode, err := selectWriteStrategy(writePlan{
+		options:           opts,
+		currentSize:       minComposePartSize,
+		targetOffset:      minComposePartSize,
+		writeLen:          1 << 20,
+		nativeAppendReady: false,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != writeModeComposeAppend {
+		t.Fatalf("expected compose append fallback, got %q", mode)
+	}
+}
+
+func TestApplyOptionsToMinioClientEnablesTrailingHeadersForNativeAppend(t *testing.T) {
+	minioOpts := &minio.Options{}
+	opts := DefaultOptions()
+	opts.AppendStrategy = AppendStrategyNative
+	opts.AssumeNativeAppendSupported = true
+
+	applyOptionsToMinioClient(minioOpts, opts)
+
+	if !minioOpts.TrailingHeaders {
+		t.Fatal("expected native append configuration to enable trailing headers")
 	}
 }
 

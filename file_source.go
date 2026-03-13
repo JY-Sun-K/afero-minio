@@ -167,13 +167,18 @@ func (o *minioFileResource) Append(b []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	nativeReady, err := o.nativeAppendReady(size, size, true)
+	if err != nil {
+		return 0, err
+	}
 
 	mode, err := selectWriteStrategy(writePlan{
-		options:      o.fs.options,
-		currentSize:  size,
-		targetOffset: size,
-		writeLen:     len(b),
-		appendOnly:   true,
+		options:           o.fs.options,
+		currentSize:       size,
+		targetOffset:      size,
+		writeLen:          len(b),
+		appendOnly:        true,
+		nativeAppendReady: nativeReady,
 	})
 	if err != nil {
 		return 0, err
@@ -198,12 +203,17 @@ func (o *minioFileResource) WriteAt(b []byte, off int64) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	nativeReady, err := o.nativeAppendReady(size, off, false)
+	if err != nil {
+		return 0, err
+	}
 
 	mode, err := selectWriteStrategy(writePlan{
-		options:      o.fs.options,
-		currentSize:  size,
-		targetOffset: off,
-		writeLen:     len(b),
+		options:           o.fs.options,
+		currentSize:       size,
+		targetOffset:      off,
+		writeLen:          len(b),
+		nativeAppendReady: nativeReady,
 	})
 	if err != nil {
 		return 0, err
@@ -480,4 +490,26 @@ func (o *minioFileResource) composeTempKey() string {
 	}
 	parts = append(parts, ".miniofs-tmp", uuid.NewString())
 	return strings.Join(parts, "/")
+}
+
+func (o *minioFileResource) nativeAppendReady(currentSize, targetOffset int64, appendOnly bool) (bool, error) {
+	opts := o.fs.options.withDefaults()
+	if opts.AppendStrategy != AppendStrategyNative || !opts.AssumeNativeAppendSupported {
+		return false, nil
+	}
+	if currentSize == 0 || (!appendOnly && targetOffset != currentSize) {
+		return false, nil
+	}
+	if o.tempFile != nil {
+		return false, nil
+	}
+
+	info, err := o.fs.statObjectByKeyWithOptions(o.fs.objectKey(o.name), minio.StatObjectOptions{Checksum: true})
+	if err != nil {
+		if errorsIsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return info.ChecksumMode == minio.ChecksumFullObjectMode.String(), nil
 }

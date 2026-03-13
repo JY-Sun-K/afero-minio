@@ -164,6 +164,77 @@ func (o *MinioFile) WriteAt(p []byte, off int64) (int, error) {
 	return o.resource.WriteAt(p, off)
 }
 
+func (o *MinioFile) ReadFrom(src io.Reader) (int64, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.closed {
+		return 0, ErrFileClosed
+	}
+	if o.openFlags&os.O_RDONLY != 0 || o.openFlags&(os.O_WRONLY|os.O_RDWR) == 0 {
+		return 0, ErrReadOnlyFile
+	}
+
+	buf := make([]byte, o.resource.fs.options.readFromChunkSize())
+	var written int64
+
+	for {
+		nr, er := io.ReadFull(src, buf)
+		if er == io.ErrUnexpectedEOF {
+			er = io.EOF
+		}
+		if nr > 0 {
+			nw, ew := o.writeReadFromChunk(buf[:nr])
+			written += int64(nw)
+			if ew != nil {
+				return written, ew
+			}
+			if nw != nr {
+				return written, io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			if er == io.EOF {
+				return written, nil
+			}
+			return written, er
+		}
+	}
+}
+
+func (o *MinioFile) writeReadFromChunk(chunk []byte) (int, error) {
+	if len(chunk) == 0 {
+		return 0, nil
+	}
+
+	if o.resource.tempFile != nil {
+		offset := o.fhOffset
+		if o.openFlags&os.O_APPEND != 0 {
+			size, err := o.resource.Size()
+			if err != nil {
+				return 0, err
+			}
+			offset = size
+		}
+		n, err := o.resource.writeTempAt(chunk, offset)
+		o.fhOffset = offset + int64(n)
+		return n, err
+	}
+
+	if o.openFlags&os.O_APPEND != 0 {
+		n, err := o.resource.Append(chunk)
+		if err != nil {
+			return n, err
+		}
+		o.fhOffset = o.resource.currentSize
+		return n, nil
+	}
+
+	n, err := o.resource.WriteAt(chunk, o.fhOffset)
+	o.fhOffset += int64(n)
+	return n, err
+}
+
 func (o *MinioFile) Name() string {
 	return filepath.FromSlash(o.resource.name)
 }
