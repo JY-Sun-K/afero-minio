@@ -3,8 +3,10 @@ package miniofs
 import (
 	"context"
 	"errors"
+	"io"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -12,19 +14,21 @@ import (
 	"github.com/spf13/afero"
 )
 
-const (
-	defaultFileMode = 0o755
-)
+const defaultFileMode = 0o755
 
-// Fs is a Fs implementation that uses functions provided by google cloud storage
 type Fs struct {
 	ctx       context.Context
 	client    *minio.Client
 	bucket    string
 	separator string
+	options   Options
 }
 
 func NewMinioFs(ctx context.Context, dsn string) (afero.Fs, error) {
+	return NewMinioFsWithOptions(ctx, dsn, DefaultOptions())
+}
+
+func NewMinioFsWithOptions(ctx context.Context, dsn string, opts Options) (afero.Fs, error) {
 	parsedURL, err := url.Parse(dsn)
 	if err != nil {
 		return nil, err
@@ -34,6 +38,9 @@ func NewMinioFs(ctx context.Context, dsn string) (afero.Fs, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	opts = opts.withDefaults()
+	applyOptionsToMinioClient(minioOpts, opts)
 
 	client, err := minio.New(parsedURL.Host, minioOpts)
 	if err != nil {
@@ -45,37 +52,61 @@ func NewMinioFs(ctx context.Context, dsn string) (afero.Fs, error) {
 		return nil, ErrNoBucketInName
 	}
 
-	return NewFs(ctx, client, bucket), nil
+	return NewFsWithOptions(ctx, client, bucket, opts)
 }
 
 func NewFs(ctx context.Context, client *minio.Client, bucket string) *Fs {
-	return &Fs{
+	fs, _ := NewFsWithOptions(ctx, client, bucket, DefaultOptions())
+	return fs
+}
+
+func NewFsWithOptions(ctx context.Context, client *minio.Client, bucket string, opts Options) (*Fs, error) {
+	if bucket == "" {
+		return nil, ErrNoBucketInName
+	}
+
+	opts = opts.withDefaults()
+	fs := &Fs{
 		ctx:       ctx,
 		client:    client,
 		bucket:    bucket,
 		separator: "/",
-	}
-}
-
-// normSeparators will normalize all "\\" and "/" to the provided separator
-func (fs *Fs) normSeparators(s string) string {
-	return strings.Replace(strings.Replace(s, "\\", fs.separator, -1), "/", fs.separator, -1)
-}
-
-func (fs *Fs) ensureNoLeadingSeparator(s string) string {
-	if len(s) > 0 && strings.HasPrefix(s, fs.separator) {
-		s = s[len(fs.separator):]
+		options:   opts,
 	}
 
-	return s
+	if opts.AppName != "" {
+		client.SetAppInfo(opts.AppName, opts.AppVersion)
+	}
+	if opts.TraceOutput != nil {
+		client.TraceOn(opts.TraceOutput)
+	}
+	if opts.ValidateBucketOnInit {
+		opCtx, cancel := fs.operationContext()
+		defer cancel()
+
+		exists, err := client.BucketExists(opCtx, bucket)
+		if err != nil {
+			return nil, mapMinioError(err)
+		}
+		if !exists {
+			return nil, NewPathError("bucket", bucket, os.ErrNotExist)
+		}
+	}
+
+	return fs, nil
 }
 
-//func (fs *Fs) getObj(name string) (*minio.Object, error) {
-//	bucketName, path := fs.splitName(name)
-//	getObjectOptions := minio.GetObjectOptions{}
-//
-//	return fs.client.GetObject(fs.ctx, bucketName, path, getObjectOptions)
-//}
+func applyOptionsToMinioClient(dst *minio.Options, opts Options) {
+	if opts.Transport != nil {
+		dst.Transport = opts.Transport
+	}
+	if opts.MaxRetries > 0 {
+		dst.MaxRetries = opts.MaxRetries
+	}
+	if opts.BucketLookup != 0 {
+		dst.BucketLookup = opts.BucketLookup
+	}
+}
 
 func (fs *Fs) Name() string { return "MinioFs" }
 
@@ -83,135 +114,47 @@ func (fs *Fs) Create(name string) (afero.File, error) {
 	return fs.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0)
 }
 
-func (fs *Fs) Mkdir(name string, _ os.FileMode) error {
-	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
-
-	// Check context
-	if err := fs.ctx.Err(); err != nil {
-		return ErrContextCanceled
-	}
-
-	// Check if parent exists
-	if name != "" && name != "." {
-		parent := strings.TrimSuffix(name, fs.separator)
-		lastSep := strings.LastIndex(parent, fs.separator)
-		if lastSep > 0 {
-			parentPath := parent[:lastSep]
-			if _, err := fs.Stat(parentPath); err != nil {
-				return NewPathError("mkdir", name, err)
-			}
-		}
-	}
-
-	// Check if directory already exists
-	if _, err := fs.Stat(name); err == nil {
-		return NewPathError("mkdir", name, os.ErrExist)
-	}
-
-	// Create directory by uploading an empty object with trailing separator
-	dirName := strings.TrimSuffix(name, fs.separator) + fs.separator
-	if err := fs.createEmptyObject(dirName); err != nil {
-		return NewPathError("mkdir", name, err)
-	}
-	return nil
-}
-
-func (fs *Fs) MkdirAll(name string, perm os.FileMode) error {
-	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
-
-	if name == "" || name == "." {
-		return nil
-	}
-
-	// Check context
-	if err := fs.ctx.Err(); err != nil {
-		return ErrContextCanceled
-	}
-
-	// Check if already exists
-	if fi, err := fs.Stat(name); err == nil {
-		if fi.IsDir() {
-			return nil
-		}
-		return NewPathError("mkdir", name, os.ErrExist)
-	}
-
-	// Create all parent directories
-	parts := strings.Split(strings.TrimSuffix(name, fs.separator), fs.separator)
-	currentPath := ""
-
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-
-		if currentPath != "" {
-			currentPath += fs.separator
-		}
-		currentPath += part
-
-		// Try to create directory, ignore if exists
-		if _, err := fs.Stat(currentPath); err != nil {
-			dirName := currentPath + fs.separator
-			if err := fs.createEmptyObject(dirName); err != nil {
-				return NewPathError("mkdir", currentPath, err)
-			}
-		}
-	}
-
-	return nil
-}
-
-// createEmptyObject creates an empty object to simulate a directory
-func (fs *Fs) createEmptyObject(name string) error {
-	opts := minio.PutObjectOptions{
-		ContentType: "application/x-directory",
-	}
-	_, err := fs.client.PutObject(fs.ctx, fs.bucket, name, strings.NewReader(""), 0, opts)
-	return err
-}
-
 func (fs *Fs) Open(name string) (afero.File, error) {
 	return fs.OpenFile(name, os.O_RDONLY, 0)
 }
 
 func (fs *Fs) OpenFile(name string, flag int, fileMode os.FileMode) (afero.File, error) {
-	if flag&os.O_APPEND != 0 {
-		return nil, NewPathError("open", name, errors.New("O_APPEND not supported for MinIO"))
+	name = fs.normalizeName(name)
+
+	info, err := fs.Stat(name)
+	pathExists := err == nil
+	isDir := pathExists && info.IsDir()
+	fileExists := pathExists && !isDir
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, NewPathError("open", name, err)
 	}
 
-	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
+	if isDir {
+		if flag&(os.O_WRONLY|os.O_RDWR|os.O_TRUNC|os.O_CREATE|os.O_APPEND) != 0 {
+			return nil, NewPathError("open", name, os.ErrInvalid)
+		}
+		return NewMinioFile(fs.ctx, fs, flag, fileMode, name), nil
+	}
 
-	// Check if file exists
-	_, statErr := fs.Stat(name)
-	fileExists := statErr == nil
-
-	// Handle O_CREATE flag
 	if flag&os.O_CREATE != 0 {
 		if fileExists && flag&os.O_EXCL != 0 {
-			return nil, os.ErrExist
+			return nil, NewPathError("open", name, os.ErrExist)
 		}
-	} else {
-		// If not creating and file doesn't exist, return error
 		if !fileExists {
-			return nil, NewPathError("open", name, os.ErrNotExist)
+			if err := fs.putEmptyObject(name, "application/octet-stream"); err != nil {
+				return nil, NewPathError("create", name, err)
+			}
+			fileExists = true
 		}
+	} else if !fileExists {
+		return nil, NewPathError("open", name, os.ErrNotExist)
 	}
 
 	file := NewMinioFile(fs.ctx, fs, flag, fileMode, name)
 
-	// Handle O_CREATE - create empty file if it doesn't exist
-	if flag&os.O_CREATE != 0 && !fileExists {
-		if _, err := file.WriteString(""); err != nil {
-			file.Close()
-			return nil, NewPathError("create", name, err)
-		}
-	}
-
-	// Handle O_TRUNC - truncate file to zero length
-	if flag&os.O_TRUNC != 0 && fileExists {
+	if flag&os.O_TRUNC != 0 {
 		if err := file.Truncate(0); err != nil {
-			file.Close()
+			_ = file.Close()
 			return nil, NewPathError("truncate", name, err)
 		}
 	}
@@ -219,122 +162,205 @@ func (fs *Fs) OpenFile(name string, flag int, fileMode os.FileMode) (afero.File,
 	return file, nil
 }
 
-func (fs *Fs) Remove(name string) error {
-	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
+func (fs *Fs) Mkdir(name string, _ os.FileMode) error {
+	name = fs.normalizeName(name)
+	if name == "" {
+		return nil
+	}
 
-	// Check context
 	if err := fs.ctx.Err(); err != nil {
 		return ErrContextCanceled
 	}
 
-	err := fs.client.RemoveObject(fs.ctx, fs.bucket, name, minio.RemoveObjectOptions{
-		GovernanceBypass: true,
-	})
+	parent := path.Dir(name)
+	if parent != "." && parent != "" {
+		if _, err := fs.Stat(parent); err != nil {
+			return NewPathError("mkdir", name, err)
+		}
+	}
+
+	if _, err := fs.Stat(name); err == nil {
+		return NewPathError("mkdir", name, os.ErrExist)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return NewPathError("mkdir", name, err)
+	}
+
+	if err := fs.createEmptyObject(fs.dirObjectKey(name), "application/x-directory"); err != nil {
+		return NewPathError("mkdir", name, err)
+	}
+
+	return nil
+}
+
+func (fs *Fs) MkdirAll(name string, _ os.FileMode) error {
+	name = fs.normalizeName(name)
+	if name == "" {
+		return nil
+	}
+
+	if err := fs.ctx.Err(); err != nil {
+		return ErrContextCanceled
+	}
+
+	parts := strings.Split(name, fs.separator)
+	current := ""
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if current == "" {
+			current = part
+		} else {
+			current += fs.separator + part
+		}
+
+		if _, err := fs.Stat(current); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return NewPathError("mkdir", current, err)
+		}
+
+		if err := fs.createEmptyObject(fs.dirObjectKey(current), "application/x-directory"); err != nil {
+			return NewPathError("mkdir", current, err)
+		}
+	}
+
+	return nil
+}
+
+func (fs *Fs) Remove(name string) error {
+	name = fs.normalizeName(name)
+
+	info, err := fs.Stat(name)
 	if err != nil {
+		return NewPathError("remove", name, err)
+	}
+
+	if info.IsDir() {
+		children, err := fs.listChildren(name, 1)
+		if err != nil {
+			return NewPathError("remove", name, err)
+		}
+		if len(children) > 0 {
+			return NewPathError("remove", name, os.ErrInvalid)
+		}
+		if err := fs.removeObjectByKey(fs.dirObjectKey(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return NewPathError("remove", name, err)
+		}
+		return nil
+	}
+
+	if err := fs.removeObjectByKey(fs.objectKey(name)); err != nil {
 		return NewPathError("remove", name, err)
 	}
 	return nil
 }
 
-func (fs *Fs) RemoveAll(path string) error {
-	path = fs.ensureNoLeadingSeparator(fs.normSeparators(path))
+func (fs *Fs) RemoveAll(pathName string) error {
+	pathName = fs.normalizeName(pathName)
 
-	// Check context
-	if err := fs.ctx.Err(); err != nil {
-		return ErrContextCanceled
+	keys, err := fs.collectRemovalKeys(pathName)
+	if err != nil {
+		return NewPathError("remove", pathName, err)
+	}
+	if len(keys) == 0 {
+		return nil
 	}
 
-	objectsCh := make(chan minio.ObjectInfo)
-	errCh := make(chan error, 1)
+	objectsCh := make(chan minio.ObjectInfo, len(keys))
+	for _, key := range keys {
+		objectsCh <- minio.ObjectInfo{Key: key}
+	}
+	close(objectsCh)
 
-	// Start goroutine to list objects
-	go func() {
-		defer close(objectsCh)
-		opts := minio.ListObjectsOptions{Prefix: path, Recursive: true}
-		for object := range fs.client.ListObjects(fs.ctx, fs.bucket, opts) {
-			if object.Err != nil {
-				errCh <- NewPathError("list", path, object.Err)
-				return
-			}
-			objectsCh <- object
-		}
-	}()
+	opCtx, cancel := fs.operationContext()
+	defer cancel()
 
-	// Remove objects in batch
-	removeErrCh := fs.client.RemoveObjects(fs.ctx, fs.bucket, objectsCh, minio.RemoveObjectsOptions{})
-
-	// Collect errors
-	var firstErr error
+	removeErrCh := fs.client.RemoveObjects(opCtx, fs.bucket, objectsCh, minio.RemoveObjectsOptions{})
 	for e := range removeErrCh {
-		if firstErr == nil {
-			firstErr = NewPathError("remove", e.ObjectName, e.Err)
+		if e.Err != nil {
+			return NewPathError("remove", fs.logicalNameFromKey(e.ObjectName), mapMinioError(e.Err))
 		}
 	}
 
-	// Check if listing encountered an error
-	select {
-	case err := <-errCh:
-		if err != nil && firstErr == nil {
-			return err
-		}
-	default:
-	}
-
-	return firstErr
+	return nil
 }
 
 func (fs *Fs) Rename(oldName, newName string) error {
+	oldName = fs.normalizeName(oldName)
+	newName = fs.normalizeName(newName)
 	if oldName == newName {
 		return nil
 	}
 
-	oldName = fs.ensureNoLeadingSeparator(fs.normSeparators(oldName))
-	newName = fs.ensureNoLeadingSeparator(fs.normSeparators(newName))
-
-	// Check context
-	if err := fs.ctx.Err(); err != nil {
-		return ErrContextCanceled
+	if _, err := fs.Stat(newName); err == nil {
+		return NewPathError("rename", newName, os.ErrExist)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return NewPathError("rename", newName, err)
 	}
 
-	// Check if source exists
-	if _, err := fs.Stat(oldName); err != nil {
-		return NewPathError("rename", oldName, os.ErrNotExist)
-	}
-	// 这个其实没有必要，因为 MinIO 的 CopyObject 会覆盖目标对象，如果目标对象不存在则会创建一个新的对象。
-	// Check if destination already exists
-	// if _, err := fs.Stat(newName); err == nil {
-	// 	return NewPathError("rename", newName, os.ErrExist)
-	// }
-
-	// Copy object
-	src := minio.CopySrcOptions{
-		Bucket: fs.bucket,
-		Object: oldName,
-	}
-	dst := minio.CopyDestOptions{
-		Bucket: fs.bucket,
-		Object: newName,
-	}
-	_, err := fs.client.CopyObject(fs.ctx, dst, src)
+	info, err := fs.Stat(oldName)
 	if err != nil {
 		return NewPathError("rename", oldName, err)
 	}
 
-	// Remove old object
-	if err := fs.Remove(oldName); err != nil {
-		// Try to clean up the copy if delete fails
-		_ = fs.Remove(newName)
+	if info.IsDir() {
+		return fs.renameDir(oldName, newName)
+	}
+
+	srcKey := fs.objectKey(oldName)
+	dstKey := fs.objectKey(newName)
+	if err := fs.copyObject(srcKey, dstKey); err != nil {
 		return NewPathError("rename", oldName, err)
+	}
+	if err := fs.removeObjectByKey(srcKey); err != nil {
+		_ = fs.removeObjectByKey(dstKey)
+		return NewPathError("rename", oldName, err)
+	}
+	return nil
+}
+
+func (fs *Fs) renameDir(oldName, newName string) error {
+	oldPrefix := fs.listPrefix(oldName)
+	newPrefix := fs.listPrefix(newName)
+
+	var keys []string
+	objects, cancel := fs.listObjects(oldPrefix, true, 0)
+	defer cancel()
+
+	for object := range objects {
+		if object.Err != nil {
+			return mapMinioError(object.Err)
+		}
+		keys = append(keys, object.Key)
+	}
+	if len(keys) == 0 {
+		if err := fs.createEmptyObject(fs.dirObjectKey(newName), "application/x-directory"); err != nil {
+			return err
+		}
+		return fs.removeObjectByKey(fs.dirObjectKey(oldName))
+	}
+
+	for _, srcKey := range keys {
+		suffix := strings.TrimPrefix(srcKey, oldPrefix)
+		dstKey := newPrefix + suffix
+		if err := fs.copyObject(srcKey, dstKey); err != nil {
+			return err
+		}
+	}
+
+	for _, key := range keys {
+		if err := fs.removeObjectByKey(key); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
 func (fs *Fs) Stat(name string) (os.FileInfo, error) {
-	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
-
-	// Handle root directory
-	if name == "" || name == "." {
+	name = fs.normalizeName(name)
+	if name == "" {
 		return &FileInfo{
 			name:     "",
 			size:     0,
@@ -344,36 +370,34 @@ func (fs *Fs) Stat(name string) (os.FileInfo, error) {
 		}, nil
 	}
 
-	// Try to stat as an object
-	stat, err := fs.client.StatObject(fs.ctx, fs.bucket, name, minio.StatObjectOptions{})
+	objectInfo, err := fs.statObjectByKey(fs.objectKey(name))
 	if err == nil {
-		return newFileInfoFromAttrs(stat, defaultFileMode), nil
+		return newFileInfoFromAttrs(objectInfo, name, defaultFileMode), nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
 	}
 
-	// Try as directory (with trailing separator)
-	dirName := strings.TrimSuffix(name, fs.separator) + fs.separator
-	stat, err = fs.client.StatObject(fs.ctx, fs.bucket, dirName, minio.StatObjectOptions{})
-	if err == nil {
-		fi := newFileInfoFromAttrs(stat, defaultFileMode)
+	dirInfo, dirErr := fs.statObjectByKey(fs.dirObjectKey(name))
+	if dirErr == nil {
+		fi := newFileInfoFromAttrs(dirInfo, name, defaultFileMode)
 		fi.isDir = true
 		if fi.size == 0 {
 			fi.size = folderSize
 		}
 		return fi, nil
 	}
-
-	// Check if it's a virtual directory (has children)
-	opts := minio.ListObjectsOptions{
-		Prefix:    dirName,
-		MaxKeys:   1,
-		Recursive: false,
+	if !errors.Is(dirErr, os.ErrNotExist) {
+		return nil, dirErr
 	}
 
-	for obj := range fs.client.ListObjects(fs.ctx, fs.bucket, opts) {
-		if obj.Err != nil {
-			return nil, obj.Err
+	objects, cancel := fs.listObjects(fs.listPrefix(name), false, 1)
+	defer cancel()
+
+	for object := range objects {
+		if object.Err != nil {
+			return nil, mapMinioError(object.Err)
 		}
-		// If we found any objects with this prefix, it's a virtual directory
 		return &FileInfo{
 			name:     name,
 			size:     folderSize,
@@ -396,4 +420,248 @@ func (fs *Fs) Chtimes(_ string, _, _ time.Time) error {
 
 func (fs *Fs) Chown(_ string, _, _ int) error {
 	return errors.New("method Chown is not implemented for Minio")
+}
+
+func (fs *Fs) normSeparators(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\\", fs.separator), "/", fs.separator)
+}
+
+func (fs *Fs) ensureNoLeadingSeparator(s string) string {
+	return strings.TrimLeft(s, fs.separator)
+}
+
+func (fs *Fs) normalizeName(name string) string {
+	name = fs.ensureNoLeadingSeparator(fs.normSeparators(name))
+	if name == "." {
+		return ""
+	}
+	return strings.TrimSuffix(name, fs.separator)
+}
+
+func (fs *Fs) objectKey(name string) string {
+	name = fs.normalizeName(name)
+	if fs.options.Prefix == "" {
+		return name
+	}
+	if name == "" {
+		return fs.options.Prefix
+	}
+	return fs.options.Prefix + fs.separator + name
+}
+
+func (fs *Fs) dirObjectKey(name string) string {
+	key := fs.objectKey(name)
+	if key == "" {
+		return ""
+	}
+	if !strings.HasSuffix(key, fs.separator) {
+		key += fs.separator
+	}
+	return key
+}
+
+func (fs *Fs) listPrefix(name string) string {
+	name = fs.normalizeName(name)
+	if name == "" {
+		if fs.options.Prefix == "" {
+			return ""
+		}
+		return fs.options.Prefix + fs.separator
+	}
+	return fs.dirObjectKey(name)
+}
+
+func (fs *Fs) logicalNameFromKey(key string) string {
+	key = strings.TrimPrefix(key, fs.options.Prefix)
+	key = strings.TrimPrefix(key, fs.separator)
+	return strings.TrimSuffix(key, fs.separator)
+}
+
+func (fs *Fs) operationContext() (context.Context, context.CancelFunc) {
+	if fs.options.OperationTimeout <= 0 {
+		return fs.ctx, func() {}
+	}
+	return context.WithTimeout(fs.ctx, fs.options.OperationTimeout)
+}
+
+func (fs *Fs) listObjects(prefix string, recursive bool, maxKeys int) (<-chan minio.ObjectInfo, context.CancelFunc) {
+	opCtx, cancel := fs.operationContext()
+	return fs.client.ListObjects(opCtx, fs.bucket, minio.ListObjectsOptions{
+		Prefix:    prefix,
+		Recursive: recursive,
+		MaxKeys:   maxKeys,
+	}), cancel
+}
+
+func (fs *Fs) statObjectByKey(key string) (minio.ObjectInfo, error) {
+	opCtx, cancel := fs.operationContext()
+	defer cancel()
+
+	info, err := fs.client.StatObject(opCtx, fs.bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		return minio.ObjectInfo{}, mapMinioError(err)
+	}
+	return info, nil
+}
+
+func (fs *Fs) createEmptyObject(key string, contentType string) error {
+	if key == "" {
+		return nil
+	}
+	opCtx, cancel := fs.operationContext()
+	defer cancel()
+
+	_, err := fs.client.PutObject(opCtx, fs.bucket, key, strings.NewReader(""), 0, minio.PutObjectOptions{
+		ContentType: contentType,
+	})
+	return mapMinioError(err)
+}
+
+func (fs *Fs) putEmptyObject(name string, contentType string) error {
+	return fs.createEmptyObject(fs.objectKey(name), contentType)
+}
+
+func (fs *Fs) removeObjectByKey(key string) error {
+	opCtx, cancel := fs.operationContext()
+	defer cancel()
+
+	err := fs.client.RemoveObject(opCtx, fs.bucket, key, minio.RemoveObjectOptions{
+		GovernanceBypass: true,
+	})
+	return mapMinioError(err)
+}
+
+func (fs *Fs) copyObject(srcKey, dstKey string) error {
+	opCtx, cancel := fs.operationContext()
+	defer cancel()
+
+	_, err := fs.client.CopyObject(opCtx, minio.CopyDestOptions{
+		Bucket: fs.bucket,
+		Object: dstKey,
+	}, minio.CopySrcOptions{
+		Bucket: fs.bucket,
+		Object: srcKey,
+	})
+	return mapMinioError(err)
+}
+
+func (fs *Fs) collectRemovalKeys(pathName string) ([]string, error) {
+	keySet := make(map[string]struct{})
+
+	if pathName == "" {
+		objects, cancel := fs.listObjects(fs.listPrefix(""), true, 0)
+		defer cancel()
+
+		for object := range objects {
+			if object.Err != nil {
+				return nil, mapMinioError(object.Err)
+			}
+			keySet[object.Key] = struct{}{}
+		}
+		return mapKeys(keySet), nil
+	}
+
+	objectKey := fs.objectKey(pathName)
+	if _, err := fs.statObjectByKey(objectKey); err == nil {
+		keySet[objectKey] = struct{}{}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	dirKey := fs.dirObjectKey(pathName)
+	if dirKey != "" {
+		if _, err := fs.statObjectByKey(dirKey); err == nil {
+			keySet[dirKey] = struct{}{}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+
+		objects, cancel := fs.listObjects(dirKey, true, 0)
+		defer cancel()
+
+		for object := range objects {
+			if object.Err != nil {
+				return nil, mapMinioError(object.Err)
+			}
+			keySet[object.Key] = struct{}{}
+		}
+	}
+
+	return mapKeys(keySet), nil
+}
+
+func (fs *Fs) listChildren(name string, maxKeys int) ([]minio.ObjectInfo, error) {
+	prefix := fs.listPrefix(name)
+	objects, cancel := fs.listObjects(prefix, false, maxKeys)
+	defer cancel()
+
+	var result []minio.ObjectInfo
+	for object := range objects {
+		if object.Err != nil {
+			return nil, mapMinioError(object.Err)
+		}
+		if object.Key == prefix {
+			continue
+		}
+		result = append(result, object)
+	}
+	return result, nil
+}
+
+func (fs *Fs) getObjectReader(name string, opts minio.GetObjectOptions) (*minio.Object, context.CancelFunc, error) {
+	opCtx, cancel := fs.operationContext()
+
+	reader, err := fs.client.GetObject(opCtx, fs.bucket, fs.objectKey(name), opts)
+	if err != nil {
+		cancel()
+		return nil, func() {}, mapMinioError(err)
+	}
+	return reader, cancel, nil
+}
+
+func (fs *Fs) putObject(name string, reader io.Reader, size int64, opts minio.PutObjectOptions) error {
+	return fs.putObjectByKey(fs.objectKey(name), reader, size, opts)
+}
+
+func (fs *Fs) putObjectByKey(key string, reader io.Reader, size int64, opts minio.PutObjectOptions) error {
+	opCtx, cancel := fs.operationContext()
+	defer cancel()
+
+	_, err := fs.client.PutObject(opCtx, fs.bucket, key, reader, size, opts)
+	return mapMinioError(err)
+}
+
+func (fs *Fs) appendObject(name string, reader io.Reader, size int64) error {
+	opCtx, cancel := fs.operationContext()
+	defer cancel()
+
+	opts := minio.AppendObjectOptions{}
+	if fs.options.NativeAppendChunkSize > 0 {
+		opts.ChunkSize = fs.options.NativeAppendChunkSize
+	}
+	_, err := fs.client.AppendObject(opCtx, fs.bucket, fs.objectKey(name), reader, size, opts)
+	return mapMinioError(err)
+}
+
+func (fs *Fs) composeObjects(dst string, srcs ...minio.CopySrcOptions) error {
+	return fs.composeObjectByKey(fs.objectKey(dst), srcs...)
+}
+
+func (fs *Fs) composeObjectByKey(dstKey string, srcs ...minio.CopySrcOptions) error {
+	opCtx, cancel := fs.operationContext()
+	defer cancel()
+
+	_, err := fs.client.ComposeObject(opCtx, minio.CopyDestOptions{
+		Bucket: fs.bucket,
+		Object: dstKey,
+	}, srcs...)
+	return mapMinioError(err)
+}
+
+func mapKeys(values map[string]struct{}) []string {
+	out := make([]string, 0, len(values))
+	for key := range values {
+		out = append(out, key)
+	}
+	return out
 }

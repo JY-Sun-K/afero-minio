@@ -15,10 +15,10 @@
 |------|------|------|
 | Create | ✅ 完整 | 创建文件，支持覆盖 |
 | Open | ✅ 完整 | 打开只读文件 |
-| OpenFile | ✅ 完整 | 支持所有标志（除 O_APPEND） |
+| OpenFile | ✅ 完整 | 支持可配置的 `O_APPEND` 策略 |
 | Remove | ✅ 完整 | 删除单个文件 |
 | RemoveAll | ✅ 完整 | 递归删除目录 |
-| Rename | ✅ 完整 | 原子性重命名（copy+delete） |
+| Rename | ✅ 完整 | 非原子 copy+delete，目标已存在时返回错误 |
 | Stat | ✅ 完整 | 支持文件和虚拟目录 |
 | Mkdir | ✅ 完整 | 创建单级目录 |
 | MkdirAll | ✅ 完整 | 创建多级目录 |
@@ -120,8 +120,8 @@ go tool cover -html=coverage.out
 4. **懒加载文件大小** - 仅在需要时获取
 
 #### 性能限制（MinIO 固有）
-- ⚠️ 非零偏移写入需要读取整个文件
-- ⚠️ 不支持真正的追加操作
+- ⚠️ 大对象随机写可能需要本地暂存
+- ⚠️ `O_APPEND` 是否可用取决于配置策略和后端能力
 - ⚠️ 目录列表可能较慢（大量对象）
 
 ### 7. 部署建议 🚀
@@ -208,10 +208,10 @@ log.Printf("[miniofs] Operation=%s Path=%s Duration=%v Error=%v",
 ### 9. 已知限制 ⚠️
 
 #### MinIO 固有限制
-1. **不支持追加** - O_APPEND 返回错误
+1. **追加能力依赖策略** - `O_APPEND` 需要兼容、compose 或 native append 策略支持
 2. **不支持权限** - Chmod/Chown 返回错误
 3. **时间戳只读** - Chtimes 返回错误
-4. **部分更新昂贵** - 需要读取+重写整个对象
+4. **大对象部分更新昂贵** - 可能需要本地暂存或被策略直接拒绝
 
 #### 使用建议
 - ✅ 适用：大文件流式传输、对象存储
@@ -229,6 +229,9 @@ golangci-lint run
 
 # 运行测试
 go test -v -race ./...
+
+# 运行真实 MinIO 集成测试
+MINIOFS_TEST_DSN='minio://minioadmin:minioadmin@127.0.0.1:9000/test-bucket' go test -v ./...
 
 # 检查代码覆盖率
 go test -cover ./...

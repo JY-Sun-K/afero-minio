@@ -4,31 +4,82 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/minio/minio-go/v7"
 	"github.com/spf13/afero"
-)
-
-const (
-	// 使用 MinIO play server 进行测试
-	// 注意：这是公共测试服务器，请不要存储敏感数据
-	minioDsn = "https://Q3AM3UQ867SPQQA43P2F:zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG@play.min.io/test-bucket?region=us-east-1"
 )
 
 // 辅助函数：获取测试用的 fs
 func getTestFs(t *testing.T) afero.Fs {
-	fs, err := NewMinioFs(context.Background(), minioDsn)
+	t.Helper()
+
+	dsn := os.Getenv("MINIOFS_TEST_DSN")
+	if dsn == "" {
+		t.Skip("MINIOFS_TEST_DSN is not set")
+	}
+
+	ensureTestBucket(t, dsn)
+
+	fs, err := NewMinioFsWithOptions(context.Background(), dsn, DefaultOptions())
 	if err != nil {
 		t.Skipf("无法连接到 MinIO: %v (跳过测试)", err)
 	}
 	return fs
 }
 
+func ensureTestBucket(t *testing.T, dsn string) {
+	t.Helper()
+
+	parsedURL, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("invalid test DSN: %v", err)
+	}
+
+	opts, err := ParseURL(dsn)
+	if err != nil {
+		t.Fatalf("ParseURL failed: %v", err)
+	}
+
+	client, err := minio.New(parsedURL.Host, opts)
+	if err != nil {
+		t.Fatalf("minio.New failed: %v", err)
+	}
+
+	bucket := strings.TrimPrefix(parsedURL.Path, "/")
+	if bucket == "" {
+		t.Fatalf("test DSN missing bucket: %q", dsn)
+	}
+
+	ctx := context.Background()
+	exists, err := client.BucketExists(ctx, bucket)
+	if err != nil {
+		t.Fatalf("BucketExists failed: %v", err)
+	}
+	if exists {
+		return
+	}
+
+	if err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{Region: opts.Region}); err != nil {
+		t.Fatalf("MakeBucket failed: %v", err)
+	}
+}
+
 func TestNewMinioFs(t *testing.T) {
+	dsn := os.Getenv("MINIOFS_TEST_DSN")
+	if dsn == "" {
+		dsn = "minio://minioadmin:minioadmin@127.0.0.1:9000/test-bucket"
+	}
+
 	t.Run("valid DSN", func(t *testing.T) {
-		fs, err := NewMinioFs(context.Background(), minioDsn)
+		if os.Getenv("MINIOFS_TEST_DSN") != "" {
+			ensureTestBucket(t, dsn)
+		}
+
+		fs, err := NewMinioFs(context.Background(), dsn)
 		if err != nil {
 			t.Skipf("无法连接到 MinIO: %v", err)
 		}

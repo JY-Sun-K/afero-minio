@@ -36,31 +36,20 @@ var (
 
 	// ErrContextCanceled indicates context was canceled
 	ErrContextCanceled = errors.New("miniofs: context canceled")
+
+	// ErrAppendNotSupported indicates append is unavailable with the current backend or strategy.
+	ErrAppendNotSupported = errors.New("miniofs: append is not supported by the configured strategy")
+
+	// ErrLargeWriteRequiresStaging indicates the write exceeds direct mode limits and needs another strategy.
+	ErrLargeWriteRequiresStaging = errors.New("miniofs: large object mutation requires temp_file or compose append strategy")
 )
 
-// PathError records an error and the operation and file path that caused it
-type PathError struct {
-	Op   string
-	Path string
-	Err  error
-}
-
-func (e *PathError) Error() string {
-	return fmt.Sprintf("miniofs: %s %s: %v", e.Op, e.Path, e.Err)
-}
-
-func (e *PathError) Unwrap() error {
-	return e.Err
-}
+type PathError = os.PathError
 
 // NewPathError creates a new PathError
 func NewPathError(op, path string, err error) error {
 	if err == nil {
 		return nil
 	}
-	return &PathError{
-		Op:   op,
-		Path: path,
-		Err:  err,
-	}
+	return &os.PathError{Op: fmt.Sprintf("miniofs: %s", op), Path: path, Err: err}
 }

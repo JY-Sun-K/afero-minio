@@ -1,8 +1,10 @@
 package miniofs
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 
@@ -27,9 +29,11 @@ func ParseURL(minioURL string) (*minio.Options, error) {
 	}
 
 	// Validate scheme
-	// if u.Scheme != "http" && u.Scheme != "https" {
-	// 	return nil, fmt.Errorf("miniofs: invalid scheme %q, must be http or https", u.Scheme)
-	// }
+	switch u.Scheme {
+	case "http", "https", "minio":
+	default:
+		return nil, fmt.Errorf("miniofs: invalid scheme %q, must be http, https, or minio", u.Scheme)
+	}
 
 	// Validate host
 	if u.Host == "" {
@@ -68,12 +72,20 @@ func ParseURL(minioURL string) (*minio.Options, error) {
 			return nil, fmt.Errorf("miniofs: invalid insecure parameter: %w", err)
 		}
 		if insecureBool && o.Secure {
-			// Note: This would require custom transport setup
-			// For now, we just note that insecure is requested
+			transport := defaultHTTPTransport()
+			transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true} //nolint:gosec // explicitly enabled by DSN option
+			o.Transport = transport
 		}
 	}
 
 	return o, nil
+}
+
+func defaultHTTPTransport() *http.Transport {
+	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+		return transport.Clone()
+	}
+	return &http.Transport{}
 }
 
 // getUserPassword extracts username and password from URL

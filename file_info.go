@@ -22,7 +22,7 @@ type FileInfo struct {
 	fileMode os.FileMode
 }
 
-func newFileInfoFromAttrs(obj minio.ObjectInfo, fileMode os.FileMode) *FileInfo {
+func newFileInfoFromAttrs(obj minio.ObjectInfo, name string, fileMode os.FileMode) *FileInfo {
 	// Check if this is a directory (ends with separator)
 	isDir := strings.HasSuffix(obj.Key, "/")
 	size := obj.Size
@@ -34,7 +34,7 @@ func newFileInfoFromAttrs(obj minio.ObjectInfo, fileMode os.FileMode) *FileInfo 
 
 	res := &FileInfo{
 		eTag:     obj.ETag,
-		name:     obj.Key,
+		name:     name,
 		size:     size,
 		updated:  obj.LastModified,
 		isDir:    isDir,

@@ -29,10 +29,10 @@ A production-ready [Afero](https://github.com/spf13/afero) filesystem implementa
 - ✓ Proper boundary condition handling
 - ✓ Directory simulation using empty objects
 - ✓ Virtual directory detection
-- ✓ Thread-safe operations
+- ✓ File-handle locking for seek/read/write state
 
 ✅ **Well Tested**
-- ✓ Comprehensive unit tests
+- ✓ Unit tests and env-driven integration tests
 - ✓ Edge case coverage
 - ✓ Integration test support
 
@@ -191,7 +191,7 @@ The DSN (Data Source Name) format is:
 scheme://accessKey:secretKey@endpoint/bucket?param=value
 ```
 
-- **scheme**: `http` or `https`
+- **scheme**: `http`, `https`, or `minio`
 - **accessKey**: MinIO access key
 - **secretKey**: MinIO secret key
 - **endpoint**: MinIO server endpoint (e.g., `play.min.io`)
@@ -216,10 +216,10 @@ MinIO is object storage without native directory support. This implementation si
 
 #### Write Operations
 
-Since MinIO doesn't support partial object updates:
-- Small writes at offset 0 are direct uploads
-- Writes at non-zero offsets read, modify, and reupload the entire object
-- This ensures correctness while optimizing common cases
+Since MinIO doesn't support generic in-place object mutation:
+- Small-object writes are handled directly
+- Large append paths can use compose/native append strategies when configured
+- Large random writes can fall back to local temp-file staging or return a strategy error
 
 #### Seeking
 
@@ -231,10 +231,10 @@ Since MinIO doesn't support partial object updates:
 
 ⚠️ **Limitations inherent to MinIO:**
 
-1. **No True Append**: File appending requires rewriting the entire object
+1. **Append Depends on Strategy**: `O_APPEND` support is configurable and native append depends on backend capabilities
 2. **No Chmod/Chown**: POSIX permissions are not supported (returns error)
 3. **No Chtimes**: Modification time is managed by MinIO (returns error)
-4. **Partial Writes**: Writes at offsets require reading and rewriting entire object
+4. **Large Random Writes**: Large in-place mutation may require temp-file staging or be rejected by policy
 
 ⚠️ **Performance Considerations:**
 
@@ -248,10 +248,10 @@ Since MinIO doesn't support partial object updates:
 |-----------|--------|-------|
 | Create | ✅ | Full support |
 | Open | ✅ | Full support |
-| OpenFile | ✅ | All flags except O_APPEND |
+| OpenFile | ✅ | Includes configurable `O_APPEND` support |
 | Remove | ✅ | Full support |
 | RemoveAll | ✅ | Deletes all objects with prefix |
-| Rename | ✅ | Implemented via copy + delete |
+| Rename | ✅ | Non-atomic copy + delete, rejects existing target |
 | Stat | ✅ | Supports files, dirs, virtual dirs |
 | Mkdir | ✅ | Creates empty object with `/` suffix |
 | MkdirAll | ✅ | Creates all parent directories |
@@ -267,16 +267,16 @@ Since MinIO doesn't support partial object updates:
 
 ### Testing
 
-Run tests against MinIO play server:
+Run the default unit-oriented suite:
 
 ```bash
 go test -v
 ```
 
-For local testing with your own MinIO instance:
+Run integration tests against your own MinIO instance by setting `MINIOFS_TEST_DSN`:
 
-```go
-const minioDsn = "http://minioadmin:minioadmin@localhost:9000/test-bucket"
+```bash
+MINIOFS_TEST_DSN='minio://minioadmin:minioadmin@127.0.0.1:9000/test-bucket' go test -v
 ```
 
 ### Contributing
@@ -323,10 +323,10 @@ This project is inspired by and builds upon:
 - ✓ 正确的边界条件处理
 - ✓ 使用空对象模拟目录
 - ✓ 虚拟目录检测
-- ✓ 线程安全操作
+- ✓ 文件句柄级的读写/Seek 锁保护
 
 ✅ **完善的测试**
-- ✓ 全面的单元测试
+- ✓ 单元测试与环境变量驱动的集成测试
 - ✓ 边界情况覆盖
 - ✓ 集成测试支持
 
@@ -433,10 +433,10 @@ https://Q3AM3UQ867SPQQA43P2F:zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG@play.min.i
 
 ⚠️ **MinIO 固有限制：**
 
-1. **无真正的追加**: 文件追加需要重写整个对象
+1. **追加能力依赖策略**: `O_APPEND` 是否可用取决于配置策略和后端能力
 2. **无 Chmod/Chown**: 不支持 POSIX 权限（返回错误）
 3. **无 Chtimes**: 修改时间由 MinIO 管理（返回错误）
-4. **部分写入**: 偏移量写入需要读取并重写整个对象
+4. **大对象随机写有限制**: 大对象就地修改可能需要本地暂存，或按策略直接拒绝
 
 ### API 覆盖
 
@@ -446,6 +446,12 @@ https://Q3AM3UQ867SPQQA43P2F:zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG@play.min.i
 
 ```bash
 go test -v
+```
+
+如需运行真实 MinIO 集成测试，请设置：
+
+```bash
+MINIOFS_TEST_DSN='minio://minioadmin:minioadmin@127.0.0.1:9000/test-bucket' go test -v
 ```
 
 ### 贡献

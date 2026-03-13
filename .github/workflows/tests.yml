@@ -8,43 +8,65 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - name: Setup go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '^1.24'
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Setup golangci-lint
-        uses:  golangci/golangci-lint-action@v3
-  test:
-    needs: lint
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-        go: ['1.24']
-        include:
-          - os: ubuntu-latest
-            go-build: ~/.cache/go-build
-    name: ${{ matrix.os }} @ Go ${{ matrix.go }}
-    runs-on: ${{ matrix.os }}
-    env:
-      GO111MODULE: on
-      GOPROXY: https://proxy.golang.org
-    steps:
-      - name: Set up Go ${{ matrix.go }}
+
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go }}
+          go-version-file: go.mod
 
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
         with:
-          ref: ${{ github.ref }}
+          version: v1.64.8
 
-      - name: Run Tests
-        run: go test -v
+  unit-test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v3
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run unit test suite
+        run: go test ./... -count=1
+
+  integration-test:
+    needs: unit-test
+    runs-on: ubuntu-latest
+    env:
+      MINIOFS_TEST_DSN: minio://minioadmin:minioadmin@127.0.0.1:9000/afero-minio-test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Download MinIO server
+        run: |
+          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o minio
+          chmod +x minio
+
+      - name: Start MinIO
+        run: |
+          mkdir -p /tmp/minio-data
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin ./minio server /tmp/minio-data --address :9000 > /tmp/minio.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/minio.log
+          exit 1
+
+      - name: Run integration test suite
+        run: go test ./... -count=1
