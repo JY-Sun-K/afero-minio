@@ -135,6 +135,25 @@ func TestSelectWriteStrategyErrors(t *testing.T) {
 	}
 }
 
+func TestSelectWriteStrategyComposeRandomWriteFallsBackToTempFile(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MaxDirectObjectSize = 8
+	opts.LargeObjectStrategy = LargeObjectStrategyCompose
+
+	mode, err := selectWriteStrategy(writePlan{
+		options:      opts,
+		currentSize:  minComposePartSize,
+		targetOffset: 1,
+		writeLen:     4,
+	})
+	if err != nil {
+		t.Fatalf("expected compose strategy random write to succeed, got %v", err)
+	}
+	if mode != writeModeTempFile {
+		t.Fatalf("expected temp file fallback, got %q", mode)
+	}
+}
+
 func TestMapMinioError(t *testing.T) {
 	err := mapMinioError(minio.ErrorResponse{Code: "NoSuchKey"})
 	if !errors.Is(err, os.ErrNotExist) {

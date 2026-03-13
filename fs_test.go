@@ -335,6 +335,41 @@ func TestRename(t *testing.T) {
 	}
 }
 
+func TestRenameReplacesExistingFile(t *testing.T) {
+	fs := getTestFs(t)
+
+	oldName := "test-rename-replace-old.txt"
+	newName := "test-rename-replace-new.txt"
+
+	t.Cleanup(func() {
+		_ = fs.Remove(oldName)
+		_ = fs.Remove(newName)
+	})
+
+	if err := afero.WriteFile(fs, oldName, []byte("source"), 0o644); err != nil {
+		t.Fatalf("创建源文件失败: %v", err)
+	}
+	if err := afero.WriteFile(fs, newName, []byte("target"), 0o644); err != nil {
+		t.Fatalf("创建目标文件失败: %v", err)
+	}
+
+	if err := fs.Rename(oldName, newName); err != nil {
+		t.Fatalf("覆盖重命名失败: %v", err)
+	}
+
+	content, err := afero.ReadFile(fs, newName)
+	if err != nil {
+		t.Fatalf("读取目标文件失败: %v", err)
+	}
+	if string(content) != "source" {
+		t.Fatalf("目标文件内容错误: %q", string(content))
+	}
+
+	if _, err := fs.Stat(oldName); !os.IsNotExist(err) {
+		t.Fatalf("源文件应该不存在，得到: %v", err)
+	}
+}
+
 func TestStat(t *testing.T) {
 	fs := getTestFs(t)
 

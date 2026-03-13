@@ -3,10 +3,12 @@ package miniofs
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -108,6 +110,60 @@ func TestResourceCloseSyncFailureRetainsStagingState(t *testing.T) {
 	}
 }
 
+func TestReaddirAdvancesCursorAndReturnsEOF(t *testing.T) {
+	transport := newFakeS3Transport()
+	transport.setObject("unit-test-bucket", "dir/", []byte{})
+	transport.setObject("unit-test-bucket", "dir/a.txt", []byte("a"))
+	transport.setObject("unit-test-bucket", "dir/b.txt", []byte("b"))
+
+	fs := newFakeTransportFs(t, context.Background(), transport, DefaultOptions())
+
+	f, err := fs.Open("dir")
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer f.Close()
+
+	first, err := f.Readdir(1)
+	if err != nil {
+		t.Fatalf("first Readdir failed: %v", err)
+	}
+	if len(first) != 1 || first[0].Name() != "a.txt" {
+		t.Fatalf("unexpected first Readdir result: %#v", first)
+	}
+
+	second, err := f.Readdir(1)
+	if err != nil {
+		t.Fatalf("second Readdir failed: %v", err)
+	}
+	if len(second) != 1 || second[0].Name() != "b.txt" {
+		t.Fatalf("unexpected second Readdir result: %#v", second)
+	}
+
+	last, err := f.Readdir(1)
+	if err != io.EOF {
+		t.Fatalf("expected io.EOF at end of directory, got %v", err)
+	}
+	if len(last) != 0 {
+		t.Fatalf("expected no entries at EOF, got %#v", last)
+	}
+}
+
+func TestRemoveDoesNotSendGovernanceBypassByDefault(t *testing.T) {
+	transport := newFakeS3Transport()
+	transport.setObject("unit-test-bucket", "delete-me.txt", []byte("payload"))
+
+	fs := newFakeTransportFs(t, context.Background(), transport, DefaultOptions())
+
+	if err := fs.Remove("delete-me.txt"); err != nil {
+		t.Fatalf("Remove failed: %v", err)
+	}
+
+	if got := transport.lastDeleteHeaders.Get("X-Amz-Bypass-Governance-Retention"); got != "" {
+		t.Fatalf("expected delete without governance bypass header, got %q", got)
+	}
+}
+
 func newFakeTransportFs(t *testing.T, ctx context.Context, transport http.RoundTripper, opts Options) *Fs {
 	t.Helper()
 
@@ -133,6 +189,7 @@ type fakeS3Transport struct {
 	mu                        sync.Mutex
 	objects                   map[string][]byte
 	putStatus                 int
+	lastDeleteHeaders         http.Header
 	blockListUntilContextDone bool
 }
 
@@ -167,7 +224,7 @@ func (t *fakeS3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			<-req.Context().Done()
 			return nil, req.Context().Err()
 		}
-		return fakeHTTPResponse(req, http.StatusOK, emptyListBucketV2Result(bucket, req.URL.Query().Get("prefix")), map[string]string{
+		return fakeHTTPResponse(req, http.StatusOK, t.listBucketV2Result(bucket, req.URL.Query().Get("prefix"), req.URL.Query().Get("delimiter")), map[string]string{
 			"Content-Type": "application/xml",
 		}), nil
 	}
@@ -208,6 +265,10 @@ func (t *fakeS3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(req, http.StatusOK, "", map[string]string{
 			"ETag": `"etag"`,
 		}), nil
+	case http.MethodDelete:
+		t.recordDeleteHeaders(req.Header)
+		t.deleteObject(bucket, key)
+		return fakeHTTPResponse(req, http.StatusNoContent, "", nil), nil
 	default:
 		return fakeErrorResponse(req, http.StatusNotImplemented, "NotImplemented"), nil
 	}
@@ -223,6 +284,18 @@ func (t *fakeS3Transport) getObject(bucket, key string) ([]byte, bool) {
 	return append([]byte(nil), data...), true
 }
 
+func (t *fakeS3Transport) deleteObject(bucket, key string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.objects, bucket+"/"+key)
+}
+
+func (t *fakeS3Transport) recordDeleteHeaders(header http.Header) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.lastDeleteHeaders = header.Clone()
+}
+
 func splitBucketAndKey(path string) (string, string) {
 	path = strings.TrimPrefix(path, "/")
 	if path == "" {
@@ -235,12 +308,78 @@ func splitBucketAndKey(path string) (string, string) {
 	return parts[0], parts[1]
 }
 
-func emptyListBucketV2Result(bucket, prefix string) string {
-	return fmt.Sprintf(
-		"<ListBucketResult><Name>%s</Name><Prefix>%s</Prefix><MaxKeys>1</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>",
-		bucket,
-		prefix,
-	)
+func (t *fakeS3Transport) listBucketV2Result(bucket, prefix, delimiter string) string {
+	type listContents struct {
+		Key          string `xml:"Key"`
+		LastModified string `xml:"LastModified"`
+		ETag         string `xml:"ETag"`
+		Size         int    `xml:"Size"`
+		StorageClass string `xml:"StorageClass"`
+	}
+	type commonPrefix struct {
+		Prefix string `xml:"Prefix"`
+	}
+	type listBucketResult struct {
+		XMLName        xml.Name       `xml:"ListBucketResult"`
+		Name           string         `xml:"Name"`
+		Prefix         string         `xml:"Prefix"`
+		Delimiter      string         `xml:"Delimiter,omitempty"`
+		MaxKeys        int            `xml:"MaxKeys"`
+		IsTruncated    bool           `xml:"IsTruncated"`
+		Contents       []listContents `xml:"Contents"`
+		CommonPrefixes []commonPrefix `xml:"CommonPrefixes,omitempty"`
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	keys := make([]string, 0, len(t.objects))
+	for fullKey := range t.objects {
+		if strings.HasPrefix(fullKey, bucket+"/") {
+			keys = append(keys, strings.TrimPrefix(fullKey, bucket+"/"))
+		}
+	}
+	sort.Strings(keys)
+
+	result := listBucketResult{
+		Name:        bucket,
+		Prefix:      prefix,
+		Delimiter:   delimiter,
+		MaxKeys:     len(keys),
+		IsTruncated: false,
+	}
+	seenPrefixes := map[string]struct{}{}
+	for _, key := range keys {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+
+		rest := strings.TrimPrefix(key, prefix)
+		if delimiter != "" && rest != "" {
+			if idx := strings.Index(rest, delimiter); idx >= 0 {
+				common := prefix + rest[:idx+1]
+				if _, ok := seenPrefixes[common]; !ok {
+					seenPrefixes[common] = struct{}{}
+					result.CommonPrefixes = append(result.CommonPrefixes, commonPrefix{Prefix: common})
+				}
+				continue
+			}
+		}
+
+		result.Contents = append(result.Contents, listContents{
+			Key:          key,
+			LastModified: time.Unix(0, 0).UTC().Format(time.RFC3339),
+			ETag:         "&quot;etag&quot;",
+			Size:         len(t.objects[bucket+"/"+key]),
+			StorageClass: "STANDARD",
+		})
+	}
+
+	out, err := xml.Marshal(result)
+	if err != nil {
+		panic(err)
+	}
+	return string(out)
 }
 
 func applyRange(data []byte, header string) ([]byte, int, map[string]string, error) {

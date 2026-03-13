@@ -15,6 +15,7 @@ type MinioFile struct {
 	mu        sync.Mutex
 	openFlags int
 	fhOffset  int64
+	dirOffset int
 	closed    bool
 	resource  *minioFileResource
 }
@@ -168,12 +169,16 @@ func (o *MinioFile) Name() string {
 }
 
 func (o *MinioFile) Readdir(count int) ([]os.FileInfo, error) {
-	fi, err := o.readdirImpl(count)
-	if err == io.EOF {
-		return []os.FileInfo{}, nil
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.closed {
+		return nil, ErrFileClosed
 	}
+
+	fi, err := o.readdirChunk(count)
 	if err != nil {
-		return nil, err
+		return []os.FileInfo{}, err
 	}
 
 	result := make([]os.FileInfo, 0, len(fi))
@@ -184,9 +189,16 @@ func (o *MinioFile) Readdir(count int) ([]os.FileInfo, error) {
 }
 
 func (o *MinioFile) Readdirnames(n int) ([]string, error) {
-	fi, err := o.Readdir(n)
-	if err != nil && err != io.EOF {
-		return nil, err
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.closed {
+		return nil, ErrFileClosed
+	}
+
+	fi, err := o.readdirChunk(n)
+	if err != nil {
+		return []string{}, err
 	}
 
 	names := make([]string, len(fi))
@@ -196,7 +208,37 @@ func (o *MinioFile) Readdirnames(n int) ([]string, error) {
 	return names, err
 }
 
-func (o *MinioFile) readdirImpl(count int) ([]*FileInfo, error) {
+func (o *MinioFile) readdirChunk(count int) ([]*FileInfo, error) {
+	entries, err := o.readdirImpl()
+	if err != nil {
+		return nil, err
+	}
+
+	if count <= 0 {
+		if o.dirOffset >= len(entries) {
+			return []*FileInfo{}, nil
+		}
+
+		chunk := entries[o.dirOffset:]
+		o.dirOffset = len(entries)
+		return chunk, nil
+	}
+
+	if o.dirOffset >= len(entries) {
+		return []*FileInfo{}, io.EOF
+	}
+
+	end := o.dirOffset + count
+	if end > len(entries) {
+		end = len(entries)
+	}
+
+	chunk := entries[o.dirOffset:end]
+	o.dirOffset = end
+	return chunk, nil
+}
+
+func (o *MinioFile) readdirImpl() ([]*FileInfo, error) {
 	info, err := o.resource.fs.Stat(o.resource.name)
 	if err != nil {
 		if o.resource.name != "" {
@@ -265,12 +307,6 @@ func (o *MinioFile) readdirImpl(count int) ([]*FileInfo, error) {
 	}
 
 	sort.Sort(ByName(result))
-	if count > 0 && len(result) > count {
-		result = result[:count]
-	}
-	if len(result) == 0 {
-		return result, io.EOF
-	}
 	return result, nil
 }
 

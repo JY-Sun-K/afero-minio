@@ -186,6 +186,43 @@ func TestIntegrationLargeRandomWriteError(t *testing.T) {
 	}
 }
 
+func TestIntegrationLargeRandomWriteComposeFallback(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MaxDirectObjectSize = 4
+	opts.LargeObjectStrategy = LargeObjectStrategyCompose
+
+	fs := getIntegrationFsWithOptions(t, opts)
+	const name = "integration-large-random-compose.txt"
+
+	t.Cleanup(func() {
+		_ = fs.Remove(name)
+	})
+
+	if err := afero.WriteFile(fs, name, []byte("abcdefgh"), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	f, err := fs.OpenFile(name, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	if _, err := f.WriteAt([]byte("ZZ"), 1); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	data, err := afero.ReadFile(fs, name)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if string(data) != "aZZdefgh" {
+		t.Fatalf("unexpected compose fallback result %q", string(data))
+	}
+}
+
 func TestIntegrationRemoveAllNamespaceSafety(t *testing.T) {
 	fs := getIntegrationFs(t)
 

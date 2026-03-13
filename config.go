@@ -185,7 +185,7 @@ func selectWriteStrategy(plan writePlan) (writeMode, error) {
 	case LargeObjectStrategyTempFile:
 		return writeModeTempFile, nil
 	case LargeObjectStrategyCompose:
-		return "", ErrLargeWriteRequiresStaging
+		return writeModeTempFile, nil
 	default:
 		return "", ErrLargeWriteRequiresStaging
 	}

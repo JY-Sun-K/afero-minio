@@ -293,19 +293,28 @@ func (fs *Fs) Rename(oldName, newName string) error {
 		return nil
 	}
 
-	if _, err := fs.Stat(newName); err == nil {
-		return NewPathError("rename", newName, os.ErrExist)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return NewPathError("rename", newName, err)
-	}
-
 	info, err := fs.Stat(oldName)
 	if err != nil {
 		return NewPathError("rename", oldName, err)
 	}
 
 	if info.IsDir() {
+		if _, err := fs.Stat(newName); err == nil {
+			return NewPathError("rename", newName, os.ErrExist)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return NewPathError("rename", newName, err)
+		}
 		return fs.renameDir(oldName, newName)
+	}
+
+	dstExists := false
+	if dstInfo, err := fs.Stat(newName); err == nil {
+		if dstInfo.IsDir() {
+			return NewPathError("rename", newName, os.ErrExist)
+		}
+		dstExists = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return NewPathError("rename", newName, err)
 	}
 
 	srcKey := fs.objectKey(oldName)
@@ -314,7 +323,9 @@ func (fs *Fs) Rename(oldName, newName string) error {
 		return NewPathError("rename", oldName, err)
 	}
 	if err := fs.removeObjectByKey(srcKey); err != nil {
-		_ = fs.removeObjectByKey(dstKey)
+		if !dstExists {
+			_ = fs.removeObjectByKey(dstKey)
+		}
 		return NewPathError("rename", oldName, err)
 	}
 	return nil
@@ -525,9 +536,7 @@ func (fs *Fs) removeObjectByKey(key string) error {
 	opCtx, cancel := fs.operationContext()
 	defer cancel()
 
-	err := fs.client.RemoveObject(opCtx, fs.bucket, key, minio.RemoveObjectOptions{
-		GovernanceBypass: true,
-	})
+	err := fs.client.RemoveObject(opCtx, fs.bucket, key, minio.RemoveObjectOptions{})
 	return mapMinioError(err)
 }
 
