@@ -138,7 +138,43 @@ if err != nil {
 - `StreamChunkSize` only affects `MinioFile.ReadFrom`, so `io.Copy(file, src)` now batches reads into larger writes automatically
 - With `AppendStrategyNative` and `AssumeNativeAppendSupported=true`, sequential writes at EOF prefer native append before the small-object direct rewrite branch
 - `LargeObjectStrategyTempFile` remains the fallback for non-sequential large writes
-- If you build your own `minio.Client` and call `NewFs`, enable `TrailingHeaders: true` on the client when opting into native append
+- DSN-based constructors now create a dedicated append client automatically when native append is enabled, so temp-file `Close/Sync` uploads continue to use the normal client
+- If you build your own `minio.Client`, use `NewFsWithClients(ctx, client, appendClient, bucket, opts)` to provide a dedicated append client
+- If you only provide a single HTTP client through `NewFs`/`NewFsWithOptions`, native append is disabled automatically and the adapter falls back to compose/temp-file paths to protect `Close/Sync`
+
+#### Advanced: Split Normal IO and Native Append Clients
+
+```go
+baseClient, err := minio.New("10.0.5.240:9000", &minio.Options{
+    Creds:  credentials.NewStaticV4("minioadmin", "minioadmin", ""),
+    Secure: false,
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+appendClient, err := minio.New("10.0.5.240:9000", &minio.Options{
+    Creds:           credentials.NewStaticV4("minioadmin", "minioadmin", ""),
+    Secure:          false,
+    TrailingHeaders: true,
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+opts := miniofs.DefaultOptions()
+opts.AppendStrategy = miniofs.AppendStrategyNative
+opts.AssumeNativeAppendSupported = true
+
+fs, err := miniofs.NewFsWithClients(context.Background(), baseClient, appendClient, "my-bucket", opts)
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+- Application code still uses `afero.File` normally: `Write`, `io.Copy`, `Sync`, and `Close`
+- In temp-file fallback mode, final persistence still happens at `Sync()` or `Close()`
+- Always check the error returned by `Close()`, because that is where staged writes are committed
 
 ### Usage Examples
 
@@ -454,7 +490,43 @@ if err != nil {
 - `StreamChunkSize` 只影响 `MinioFile.ReadFrom`，所以 `io.Copy(file, src)` 会自动聚合成更大的写入块
 - 在 `AppendStrategyNative` 且 `AssumeNativeAppendSupported=true` 时，顺序写到 EOF 会优先走 native append，而不是先落到小对象 direct rewrite
 - 非顺序的大对象写入仍然由 `LargeObjectStrategyTempFile` 兜底
-- 如果你自行创建 `minio.Client` 再调用 `NewFs`，启用 native append 时需要同时把客户端的 `TrailingHeaders` 打开
+- 使用 DSN 构造时，启用 native append 会自动创建专用 append client，因此 temp-file 的 `Close/Sync` 上传仍然走普通 client
+- 如果你自行创建 `minio.Client`，推荐改用 `NewFsWithClients(ctx, client, appendClient, bucket, opts)` 显式传入专用 append client
+- 如果你只通过 `NewFs`/`NewFsWithOptions` 传入单个 HTTP client，插件会自动关闭 native append，并安全回退到 compose/temp-file 路径，避免影响 `Close/Sync`
+
+#### 高级用法：拆分普通对象 IO 与 Native Append Client
+
+```go
+baseClient, err := minio.New("10.0.5.240:9000", &minio.Options{
+    Creds:  credentials.NewStaticV4("minioadmin", "minioadmin", ""),
+    Secure: false,
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+appendClient, err := minio.New("10.0.5.240:9000", &minio.Options{
+    Creds:           credentials.NewStaticV4("minioadmin", "minioadmin", ""),
+    Secure:          false,
+    TrailingHeaders: true,
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+opts := miniofs.DefaultOptions()
+opts.AppendStrategy = miniofs.AppendStrategyNative
+opts.AssumeNativeAppendSupported = true
+
+fs, err := miniofs.NewFsWithClients(context.Background(), baseClient, appendClient, "my-bucket", opts)
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+- 业务代码仍然只按 `afero.File` 的方式使用：`Write`、`io.Copy`、`Sync`、`Close`
+- 走 temp-file fallback 时，真正的远端提交边界仍然是 `Sync()` 或 `Close()`
+- 不要忽略 `Close()` 返回值，因为 staged write 的最终提交就在这里发生
 
 ### 使用示例
 

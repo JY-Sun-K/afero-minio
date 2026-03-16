@@ -169,13 +169,26 @@ func TestSelectWriteStrategyFallsBackWhenNativeAppendIsNotReady(t *testing.T) {
 	}
 }
 
-func TestApplyOptionsToMinioClientEnablesTrailingHeadersForNativeAppend(t *testing.T) {
+func TestApplyBaseOptionsToMinioClientLeavesTrailingHeadersDisabled(t *testing.T) {
 	minioOpts := &minio.Options{}
 	opts := DefaultOptions()
 	opts.AppendStrategy = AppendStrategyNative
 	opts.AssumeNativeAppendSupported = true
 
-	applyOptionsToMinioClient(minioOpts, opts)
+	applyBaseOptionsToMinioClient(minioOpts, opts)
+
+	if minioOpts.TrailingHeaders {
+		t.Fatal("expected base client configuration to leave trailing headers disabled")
+	}
+}
+
+func TestApplyAppendOptionsToMinioClientEnablesTrailingHeadersForNativeAppend(t *testing.T) {
+	minioOpts := &minio.Options{}
+	opts := DefaultOptions()
+	opts.AppendStrategy = AppendStrategyNative
+	opts.AssumeNativeAppendSupported = true
+
+	applyAppendOptionsToMinioClient(minioOpts, opts)
 
 	if !minioOpts.TrailingHeaders {
 		t.Fatal("expected native append configuration to enable trailing headers")
