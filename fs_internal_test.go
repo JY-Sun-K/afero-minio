@@ -307,19 +307,112 @@ func TestCopyAtNonEOFUsesCompatibleWritePath(t *testing.T) {
 	}
 }
 
+func TestNewFsWithOptionsSingleHTTPClientFallsBackFromNativeAppend(t *testing.T) {
+	transport := newFakeS3Transport()
+
+	opts := DefaultOptions()
+	opts.MaxDirectObjectSize = 4
+	opts.AppendStrategy = AppendStrategyNative
+	opts.AssumeNativeAppendSupported = true
+	opts.LargeObjectStrategy = LargeObjectStrategyTempFile
+
+	fs := newFakeProvidedClientFs(t, context.Background(), transport, opts)
+
+	largePrefix := bytes.Repeat([]byte("a"), 1024)
+	if err := afero.WriteFile(fs, "append-single-client.bin", largePrefix, 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	transport.resetCounts()
+
+	f, err := fs.OpenFile("append-single-client.bin", os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if _, err := f.Write([]byte("tail")); err != nil {
+		t.Fatalf("append write failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.appends != 0 {
+		t.Fatalf("expected single HTTP client path to avoid native append, got %+v", stats)
+	}
+}
+
+func TestNewFsWithClientsRoutesAppendRequestsToDedicatedAppendClient(t *testing.T) {
+	backend := newFakeS3Transport()
+	baseRecorder := newRecordingTransport(backend)
+	appendRecorder := newRecordingTransport(backend)
+
+	opts := DefaultOptions()
+	opts.MaxDirectObjectSize = 4
+	opts.AppendStrategy = AppendStrategyNative
+	opts.AssumeNativeAppendSupported = true
+
+	client := newFakeMinioClient(t, baseRecorder)
+	appendClient := newFakeAppendMinioClient(t, appendRecorder, opts)
+
+	fs, err := NewFsWithClients(context.Background(), client, appendClient, "unit-test-bucket", opts)
+	if err != nil {
+		t.Fatalf("NewFsWithClients failed: %v", err)
+	}
+	if fs.appendClient == nil {
+		t.Fatal("expected dedicated append client to be configured")
+	}
+
+	largePrefix := bytes.Repeat([]byte("a"), int(minComposePartSize))
+	if err := afero.WriteFile(fs, "append-dedicated-client.bin", largePrefix, 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	f, err := fs.OpenFile("append-dedicated-client.bin", os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if _, err := f.Write([]byte("tail")); err != nil {
+		t.Fatalf("append write failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	if appendRecorder.snapshot().appendPuts != 1 {
+		t.Fatalf("expected dedicated append client to handle append request, got %+v", appendRecorder.snapshot())
+	}
+	if baseRecorder.snapshot().appendPuts != 0 {
+		t.Fatalf("expected base client to avoid append request, got %+v", baseRecorder.snapshot())
+	}
+}
+
 func newFakeTransportFs(t *testing.T, ctx context.Context, transport http.RoundTripper, opts Options) *Fs {
 	t.Helper()
 
-	minioOpts := &minio.Options{
+	client := newFakeMinioClient(t, transport)
+
+	var appendClient *minio.Client
+	if shouldCreateDedicatedAppendClient(opts) {
+		appendClient = newFakeAppendMinioClient(t, transport, opts)
+	}
+
+	fs, err := NewFsWithClients(ctx, client, appendClient, "unit-test-bucket", opts)
+	if err != nil {
+		t.Fatalf("NewFsWithClients failed: %v", err)
+	}
+	return fs
+}
+
+func newFakeProvidedClientFs(t *testing.T, ctx context.Context, transport http.RoundTripper, opts Options) *Fs {
+	t.Helper()
+
+	client, err := minio.New("fake.minio.local", &minio.Options{
 		Creds:        credentials.NewStaticV4("test-access", "test-secret", ""),
 		Secure:       false,
 		Region:       "us-east-1",
 		BucketLookup: minio.BucketLookupPath,
 		Transport:    transport,
-	}
-	applyOptionsToMinioClient(minioOpts, opts)
-
-	client, err := minio.New("fake.minio.local", minioOpts)
+	})
 	if err != nil {
 		t.Fatalf("minio.New failed: %v", err)
 	}
@@ -329,6 +422,42 @@ func newFakeTransportFs(t *testing.T, ctx context.Context, transport http.RoundT
 		t.Fatalf("NewFsWithOptions failed: %v", err)
 	}
 	return fs
+}
+
+func newFakeMinioClient(t *testing.T, transport http.RoundTripper) *minio.Client {
+	t.Helper()
+
+	client, err := minio.New("fake.minio.local", &minio.Options{
+		Creds:        credentials.NewStaticV4("test-access", "test-secret", ""),
+		Secure:       false,
+		Region:       "us-east-1",
+		BucketLookup: minio.BucketLookupPath,
+		Transport:    transport,
+	})
+	if err != nil {
+		t.Fatalf("minio.New failed: %v", err)
+	}
+	return client
+}
+
+func newFakeAppendMinioClient(t *testing.T, transport http.RoundTripper, opts Options) *minio.Client {
+	t.Helper()
+
+	minioOpts := &minio.Options{
+		Creds:        credentials.NewStaticV4("test-access", "test-secret", ""),
+		Secure:       false,
+		Region:       "us-east-1",
+		BucketLookup: minio.BucketLookupPath,
+		Transport:    transport,
+	}
+	applyAppendOptionsToMinioClient(minioOpts, opts)
+	minioOpts.TrailingHeaders = true
+
+	client, err := minio.New("fake.minio.local", minioOpts)
+	if err != nil {
+		t.Fatalf("minio.New append client failed: %v", err)
+	}
+	return client
 }
 
 type fakeS3Transport struct {
@@ -508,6 +637,48 @@ type requestCounts struct {
 	appends int
 	gets    int
 	heads   int
+}
+
+type recordingTransport struct {
+	base *fakeS3Transport
+	mu   sync.Mutex
+	reqs recordingCounts
+}
+
+type recordingCounts struct {
+	puts       int
+	appendPuts int
+	gets       int
+	heads      int
+}
+
+func newRecordingTransport(base *fakeS3Transport) *recordingTransport {
+	return &recordingTransport{base: base}
+}
+
+func (t *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	switch req.Method {
+	case http.MethodPut:
+		if req.Header.Get("X-Amz-Write-Offset-Bytes") != "" {
+			t.reqs.appendPuts++
+		} else {
+			t.reqs.puts++
+		}
+	case http.MethodGet:
+		t.reqs.gets++
+	case http.MethodHead:
+		t.reqs.heads++
+	}
+	t.mu.Unlock()
+
+	return t.base.RoundTrip(req)
+}
+
+func (t *recordingTransport) snapshot() recordingCounts {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.reqs
 }
 
 func (t *fakeS3Transport) snapshotCounts() requestCounts {

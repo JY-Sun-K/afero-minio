@@ -17,11 +17,12 @@ import (
 const defaultFileMode = 0o755
 
 type Fs struct {
-	ctx       context.Context
-	client    *minio.Client
-	bucket    string
-	separator string
-	options   Options
+	ctx          context.Context
+	client       *minio.Client
+	appendClient *minio.Client
+	bucket       string
+	separator    string
+	options      Options
 }
 
 func NewMinioFs(ctx context.Context, dsn string) (afero.Fs, error) {
@@ -40,11 +41,22 @@ func NewMinioFsWithOptions(ctx context.Context, dsn string, opts Options) (afero
 	}
 
 	opts = opts.withDefaults()
-	applyOptionsToMinioClient(minioOpts, opts)
+	applyBaseOptionsToMinioClient(minioOpts, opts)
 
 	client, err := minio.New(parsedURL.Host, minioOpts)
 	if err != nil {
 		return nil, err
+	}
+
+	var appendClient *minio.Client
+	if shouldCreateDedicatedAppendClient(opts) {
+		appendOpts := *minioOpts
+		applyAppendOptionsToMinioClient(&appendOpts, opts)
+
+		appendClient, err = minio.New(parsedURL.Host, &appendOpts)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	bucket := strings.TrimPrefix(parsedURL.Path, "/")
@@ -52,7 +64,7 @@ func NewMinioFsWithOptions(ctx context.Context, dsn string, opts Options) (afero
 		return nil, ErrNoBucketInName
 	}
 
-	return NewFsWithOptions(ctx, client, bucket, opts)
+	return NewFsWithClients(ctx, client, appendClient, bucket, opts)
 }
 
 func NewFs(ctx context.Context, client *minio.Client, bucket string) *Fs {
@@ -61,24 +73,40 @@ func NewFs(ctx context.Context, client *minio.Client, bucket string) *Fs {
 }
 
 func NewFsWithOptions(ctx context.Context, client *minio.Client, bucket string, opts Options) (*Fs, error) {
+	return newFs(ctx, client, nil, bucket, opts)
+}
+
+func NewFsWithClients(ctx context.Context, client *minio.Client, appendClient *minio.Client, bucket string, opts Options) (*Fs, error) {
+	return newFs(ctx, client, appendClient, bucket, opts)
+}
+
+func newFs(ctx context.Context, client *minio.Client, appendClient *minio.Client, bucket string, opts Options) (*Fs, error) {
 	if bucket == "" {
 		return nil, ErrNoBucketInName
 	}
 
 	opts = opts.withDefaults()
+	appendClient, opts = resolveAppendClient(client, appendClient, opts)
 	fs := &Fs{
-		ctx:       ctx,
-		client:    client,
-		bucket:    bucket,
-		separator: "/",
-		options:   opts,
+		ctx:          ctx,
+		client:       client,
+		appendClient: appendClient,
+		bucket:       bucket,
+		separator:    "/",
+		options:      opts,
 	}
 
 	if opts.AppName != "" {
 		client.SetAppInfo(opts.AppName, opts.AppVersion)
+		if appendClient != nil && appendClient != client {
+			appendClient.SetAppInfo(opts.AppName, opts.AppVersion)
+		}
 	}
 	if opts.TraceOutput != nil {
 		client.TraceOn(opts.TraceOutput)
+		if appendClient != nil && appendClient != client {
+			appendClient.TraceOn(opts.TraceOutput)
+		}
 	}
 	if opts.ValidateBucketOnInit {
 		opCtx, cancel := fs.operationContext()
@@ -101,7 +129,7 @@ func NewFsWithOptions(ctx context.Context, client *minio.Client, bucket string, 
 	return fs, nil
 }
 
-func applyOptionsToMinioClient(dst *minio.Options, opts Options) {
+func applyBaseOptionsToMinioClient(dst *minio.Options, opts Options) {
 	opts = opts.withDefaults()
 
 	if opts.Transport != nil {
@@ -113,9 +141,36 @@ func applyOptionsToMinioClient(dst *minio.Options, opts Options) {
 	if opts.BucketLookup != 0 {
 		dst.BucketLookup = opts.BucketLookup
 	}
+}
+
+func applyAppendOptionsToMinioClient(dst *minio.Options, opts Options) {
+	applyBaseOptionsToMinioClient(dst, opts)
 	if opts.AppendStrategy == AppendStrategyNative && opts.AssumeNativeAppendSupported {
 		dst.TrailingHeaders = true
 	}
+}
+
+func shouldCreateDedicatedAppendClient(opts Options) bool {
+	opts = opts.withDefaults()
+	return opts.AppendStrategy == AppendStrategyNative && opts.AssumeNativeAppendSupported
+}
+
+func resolveAppendClient(client *minio.Client, appendClient *minio.Client, opts Options) (*minio.Client, Options) {
+	opts = opts.withDefaults()
+	if !shouldCreateDedicatedAppendClient(opts) {
+		return nil, opts
+	}
+	if appendClient != nil {
+		return appendClient, opts
+	}
+
+	endpoint := client.EndpointURL()
+	if endpoint != nil && endpoint.Scheme == "http" {
+		opts.AssumeNativeAppendSupported = false
+		return nil, opts
+	}
+
+	return client, opts
 }
 
 func (fs *Fs) Name() string { return "MinioFs" }
@@ -662,7 +717,11 @@ func (fs *Fs) appendObject(name string, reader io.Reader, size int64) error {
 	if fs.options.NativeAppendChunkSize > 0 && size > int64(fs.options.NativeAppendChunkSize) {
 		opts.ChunkSize = fs.options.NativeAppendChunkSize
 	}
-	_, err := fs.client.AppendObject(opCtx, fs.bucket, fs.objectKey(name), reader, size, opts)
+	appendClient := fs.client
+	if fs.appendClient != nil {
+		appendClient = fs.appendClient
+	}
+	_, err := appendClient.AppendObject(opCtx, fs.bucket, fs.objectKey(name), reader, size, opts)
 	return mapMinioError(err)
 }
 

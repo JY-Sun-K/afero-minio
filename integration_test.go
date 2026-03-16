@@ -496,3 +496,49 @@ func TestIntegrationCopyAtEOFPrefersNativeAppend(t *testing.T) {
 		t.Fatalf("unexpected append boundaries %q %q %q", data[:1], data[len(initial):len(initial)+1], data[len(data)-1:])
 	}
 }
+
+func TestIntegrationTempFileCloseSucceedsWithNativeAppendOptIn(t *testing.T) {
+	requireNativeAppendIntegration(t)
+
+	opts := nativeAppendIntegrationOptions()
+	opts.LargeObjectStrategy = LargeObjectStrategyTempFile
+
+	fs := getIntegrationFsWithOptions(t, opts)
+	const name = "integration-tempfile-close-native.txt"
+
+	t.Cleanup(func() {
+		_ = fs.Remove(name)
+	})
+
+	f, err := fs.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+
+	chunk := strings.Repeat("a", 1<<20)
+	for i := 0; i < 20; i++ {
+		if _, err := f.Write([]byte(chunk)); err != nil {
+			t.Fatalf("Write failed at chunk %d: %v", i, err)
+		}
+	}
+	if _, err := f.Seek(1, io.SeekStart); err != nil {
+		t.Fatalf("Seek failed: %v", err)
+	}
+	if _, err := f.Write([]byte("ZZ")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	data, err := afero.ReadFile(fs, name)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if len(data) != 20*(1<<20) {
+		t.Fatalf("unexpected object size %d", len(data))
+	}
+	if string(data[:3]) != "aZZ" {
+		t.Fatalf("unexpected object prefix %q", string(data[:3]))
+	}
+}
