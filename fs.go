@@ -92,7 +92,12 @@ func NewFsWithOptions(ctx context.Context, client *minio.Client, bucket string, 
 			return nil, NewPathError("bucket", bucket, os.ErrNotExist)
 		}
 	}
-
+	if opts.LargeObjectStrategy == LargeObjectStrategyTempFile {
+		// 如果使用临时文件，则需要使用本地磁盘作为中间件
+		if err := os.MkdirAll(opts.TempDir, 0o755); err != nil {
+			return nil, NewPathError("mkdir", opts.TempDir, err)
+		}
+	}
 	return fs, nil
 }
 
