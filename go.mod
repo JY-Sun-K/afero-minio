@@ -18,7 +18,6 @@ require (
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/google/uuid v1.6.0
 	github.com/klauspost/compress v1.18.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
