@@ -56,6 +56,8 @@ type Options struct {
 	AssumeNativeAppendSupported bool
 	NativeAppendChunkSize       uint64
 	StreamChunkSize             uint64
+	// EnablePerfLog 启用性能日志输出（默认 false）
+	EnablePerfLog bool
 }
 
 func DefaultOptions() Options {

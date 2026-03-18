@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net/url"
 	"os"
 	"path"
@@ -23,6 +24,13 @@ type Fs struct {
 	bucket       string
 	separator    string
 	options      Options
+}
+
+// perfLog 性能日志输出，仅在 EnablePerfLog 为 true 时打印
+func (fs *Fs) perfLog(format string, args ...interface{}) {
+	if fs.options.EnablePerfLog {
+		log.Printf(format, args...)
+	}
 }
 
 func NewMinioFs(ctx context.Context, dsn string) (afero.Fs, error) {
@@ -120,7 +128,12 @@ func newFs(ctx context.Context, client *minio.Client, appendClient *minio.Client
 			return nil, NewPathError("bucket", bucket, os.ErrNotExist)
 		}
 	}
-
+	if opts.LargeObjectStrategy == LargeObjectStrategyTempFile {
+		// 如果使用临时文件，则需要使用本地磁盘作为中间件
+		if err := os.MkdirAll(opts.TempDir, 0o755); err != nil {
+			return nil, NewPathError("mkdir", opts.TempDir, err)
+		}
+	}
 	return fs, nil
 }
 
@@ -179,9 +192,13 @@ func (fs *Fs) Open(name string) (afero.File, error) {
 }
 
 func (fs *Fs) OpenFile(name string, flag int, fileMode os.FileMode) (afero.File, error) {
+	start := time.Now()
 	name = fs.normalizeName(name)
 
+	statStart := time.Now()
 	info, err := fs.Stat(name)
+	fs.perfLog("⏱️ [OpenFile.Stat] name=%s, elapsed=%v, err=%v", name, time.Since(statStart), err)
+
 	pathExists := err == nil
 	isDir := pathExists && info.IsDir()
 	fileExists := pathExists && !isDir
@@ -193,6 +210,7 @@ func (fs *Fs) OpenFile(name string, flag int, fileMode os.FileMode) (afero.File,
 		if flag&(os.O_WRONLY|os.O_RDWR|os.O_TRUNC|os.O_CREATE|os.O_APPEND) != 0 {
 			return nil, NewPathError("open", name, os.ErrInvalid)
 		}
+		fs.perfLog("⏱️ [OpenFile] name=%s (dir), total elapsed=%v", name, time.Since(start))
 		return NewMinioFile(fs.ctx, fs, flag, fileMode, name), nil
 	}
 
@@ -201,9 +219,11 @@ func (fs *Fs) OpenFile(name string, flag int, fileMode os.FileMode) (afero.File,
 			return nil, NewPathError("open", name, os.ErrExist)
 		}
 		if !fileExists {
+			putStart := time.Now()
 			if err := fs.putEmptyObject(name, "application/octet-stream"); err != nil {
 				return nil, NewPathError("create", name, err)
 			}
+			fs.perfLog("⏱️ [OpenFile.putEmptyObject] name=%s, elapsed=%v", name, time.Since(putStart))
 			fileExists = true
 		}
 	} else if !fileExists {
@@ -213,12 +233,15 @@ func (fs *Fs) OpenFile(name string, flag int, fileMode os.FileMode) (afero.File,
 	file := NewMinioFile(fs.ctx, fs, flag, fileMode, name)
 
 	if flag&os.O_TRUNC != 0 {
+		truncStart := time.Now()
 		if err := file.Truncate(0); err != nil {
 			_ = file.Close()
 			return nil, NewPathError("truncate", name, err)
 		}
+		fs.perfLog("⏱️ [OpenFile.Truncate] name=%s, elapsed=%v", name, time.Since(truncStart))
 	}
 
+	fs.perfLog("⏱️ [OpenFile] name=%s, total elapsed=%v", name, time.Since(start))
 	return file, nil
 }
 
@@ -262,24 +285,39 @@ func (fs *Fs) MkdirAll(name string, _ os.FileMode) error {
 		return ErrContextCanceled
 	}
 
-	parts := strings.Split(name, fs.separator)
-	current := ""
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		if current == "" {
-			current = part
-		} else {
-			current += fs.separator + part
-		}
+	// 快速路径：完整路径已存在
+	if _, err := fs.Stat(name); err == nil {
+		return nil
+	}
 
+	// 分割路径
+	parts := strings.Split(name, fs.separator)
+	// 过滤空部分
+	var validParts []string
+	for _, part := range parts {
+		if part != "" {
+			validParts = append(validParts, part)
+		}
+	}
+	if len(validParts) == 0 {
+		return nil
+	}
+
+	// 反向查找：从后往前找第一个存在的父目录
+	firstExistIndex := -1
+	for i := len(validParts) - 1; i >= 0; i-- {
+		current := strings.Join(validParts[:i+1], fs.separator)
 		if _, err := fs.Stat(current); err == nil {
-			continue
+			firstExistIndex = i
+			break
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return NewPathError("mkdir", current, err)
 		}
+	}
 
+	// 从第一个存在的目录的下一级开始创建
+	for i := firstExistIndex + 1; i < len(validParts); i++ {
+		current := strings.Join(validParts[:i+1], fs.separator)
 		if err := fs.createEmptyObject(fs.dirObjectKey(current), "application/x-directory"); err != nil {
 			return NewPathError("mkdir", current, err)
 		}
@@ -430,6 +468,7 @@ func (fs *Fs) renameDir(oldName, newName string) error {
 }
 
 func (fs *Fs) Stat(name string) (os.FileInfo, error) {
+	start := time.Now()
 	name = fs.normalizeName(name)
 	if name == "" {
 		return &FileInfo{
@@ -441,16 +480,20 @@ func (fs *Fs) Stat(name string) (os.FileInfo, error) {
 		}, nil
 	}
 
+	statStart := time.Now()
 	objectInfo, err := fs.statObjectByKey(fs.objectKey(name))
 	if err == nil {
+		fs.perfLog("⏱️ [Stat] name=%s (file), statObjectByKey elapsed=%v", name, time.Since(statStart))
 		return newFileInfoFromAttrs(objectInfo, name, defaultFileMode), nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 
+	dirStatStart := time.Now()
 	dirInfo, dirErr := fs.statObjectByKey(fs.dirObjectKey(name))
 	if dirErr == nil {
+		fs.perfLog("⏱️ [Stat] name=%s (dir), statObjectByKey elapsed=%v", name, time.Since(dirStatStart))
 		fi := newFileInfoFromAttrs(dirInfo, name, defaultFileMode)
 		fi.isDir = true
 		if fi.size == 0 {
@@ -462,6 +505,7 @@ func (fs *Fs) Stat(name string) (os.FileInfo, error) {
 		return nil, dirErr
 	}
 
+	listStart := time.Now()
 	objects, cancel := fs.listObjects(fs.listPrefix(name), false, 1)
 	defer cancel()
 
@@ -469,6 +513,7 @@ func (fs *Fs) Stat(name string) (os.FileInfo, error) {
 		if object.Err != nil {
 			return nil, mapMinioError(object.Err)
 		}
+		fs.perfLog("⏱️ [Stat] name=%s (dir via list), listObjects elapsed=%v", name, time.Since(listStart))
 		return &FileInfo{
 			name:     name,
 			size:     folderSize,
@@ -478,6 +523,7 @@ func (fs *Fs) Stat(name string) (os.FileInfo, error) {
 		}, nil
 	}
 
+	fs.perfLog("⏱️ [Stat] name=%s, not found, total elapsed=%v", name, time.Since(start))
 	return nil, os.ErrNotExist
 }
 
@@ -569,13 +615,17 @@ func (fs *Fs) statObjectByKey(key string) (minio.ObjectInfo, error) {
 }
 
 func (fs *Fs) statObjectByKeyWithOptions(key string, opts minio.StatObjectOptions) (minio.ObjectInfo, error) {
+	start := time.Now()
 	opCtx, cancel := fs.operationContext()
 	defer cancel()
 
 	info, err := fs.client.StatObject(opCtx, fs.bucket, key, opts)
 	if err != nil {
-		return minio.ObjectInfo{}, mapMinioError(err)
+		mappedErr := mapMinioError(err)
+		fs.perfLog("⏱️ [StatObject] key=%s, elapsed=%v, err=%v", key, time.Since(start), mappedErr)
+		return minio.ObjectInfo{}, mappedErr
 	}
+	fs.perfLog("⏱️ [StatObject] key=%s, size=%d, elapsed=%v", key, info.Size, time.Since(start))
 	return info, nil
 }
 
@@ -583,13 +633,19 @@ func (fs *Fs) createEmptyObject(key string, contentType string) error {
 	if key == "" {
 		return nil
 	}
+	start := time.Now()
 	opCtx, cancel := fs.operationContext()
 	defer cancel()
 
 	_, err := fs.client.PutObject(opCtx, fs.bucket, key, strings.NewReader(""), 0, minio.PutObjectOptions{
 		ContentType: contentType,
 	})
-	return mapMinioError(err)
+	if err != nil {
+		fs.perfLog("⏱️ [CreateEmptyObject] key=%s, elapsed=%v, err=%v", key, time.Since(start), err)
+		return mapMinioError(err)
+	}
+	fs.perfLog("⏱️ [CreateEmptyObject] key=%s, elapsed=%v", key, time.Since(start))
+	return nil
 }
 
 func (fs *Fs) putEmptyObject(name string, contentType string) error {
@@ -597,14 +653,21 @@ func (fs *Fs) putEmptyObject(name string, contentType string) error {
 }
 
 func (fs *Fs) removeObjectByKey(key string) error {
+	start := time.Now()
 	opCtx, cancel := fs.operationContext()
 	defer cancel()
 
 	err := fs.client.RemoveObject(opCtx, fs.bucket, key, minio.RemoveObjectOptions{})
-	return mapMinioError(err)
+	if err != nil {
+		fs.perfLog("⏱️ [RemoveObject] key=%s, elapsed=%v, err=%v", key, time.Since(start), err)
+		return mapMinioError(err)
+	}
+	fs.perfLog("⏱️ [RemoveObject] key=%s, elapsed=%v", key, time.Since(start))
+	return nil
 }
 
 func (fs *Fs) copyObject(srcKey, dstKey string) error {
+	start := time.Now()
 	opCtx, cancel := fs.operationContext()
 	defer cancel()
 
@@ -615,7 +678,12 @@ func (fs *Fs) copyObject(srcKey, dstKey string) error {
 		Bucket: fs.bucket,
 		Object: srcKey,
 	})
-	return mapMinioError(err)
+	if err != nil {
+		fs.perfLog("⏱️ [CopyObject] src=%s, dst=%s, elapsed=%v, err=%v", srcKey, dstKey, time.Since(start), err)
+		return mapMinioError(err)
+	}
+	fs.perfLog("⏱️ [CopyObject] src=%s, dst=%s, elapsed=%v", srcKey, dstKey, time.Since(start))
+	return nil
 }
 
 func (fs *Fs) collectRemovalKeys(pathName string) ([]string, error) {
@@ -682,13 +750,17 @@ func (fs *Fs) listChildren(name string, maxKeys int) ([]minio.ObjectInfo, error)
 }
 
 func (fs *Fs) getObjectReader(name string, opts minio.GetObjectOptions) (*minio.Object, context.CancelFunc, error) {
+	start := time.Now()
 	opCtx, cancel := fs.operationContext()
 
-	reader, err := fs.client.GetObject(opCtx, fs.bucket, fs.objectKey(name), opts)
+	key := fs.objectKey(name)
+	reader, err := fs.client.GetObject(opCtx, fs.bucket, key, opts)
 	if err != nil {
 		cancel()
+		fs.perfLog("⏱️ [GetObject] key=%s, elapsed=%v, err=%v", key, time.Since(start), err)
 		return nil, func() {}, mapMinioError(err)
 	}
+	fs.perfLog("⏱️ [GetObject] key=%s, elapsed=%v", key, time.Since(start))
 	return reader, cancel, nil
 }
 
@@ -697,14 +769,21 @@ func (fs *Fs) putObject(name string, reader io.Reader, size int64, opts minio.Pu
 }
 
 func (fs *Fs) putObjectByKey(key string, reader io.Reader, size int64, opts minio.PutObjectOptions) error {
+	start := time.Now()
 	opCtx, cancel := fs.operationContext()
 	defer cancel()
 
-	_, err := fs.client.PutObject(opCtx, fs.bucket, key, reader, size, opts)
-	return mapMinioError(err)
+	objInfo, err := fs.client.PutObject(opCtx, fs.bucket, key, reader, size, opts)
+	if err != nil {
+		fs.perfLog("⏱️ [PutObject] key=%s, size=%d, elapsed=%v, err=%v", key, size, time.Since(start), err)
+		return mapMinioError(err)
+	}
+	fs.perfLog("⏱️ [PutObject] key=%s, size=%d, uploaded=%d, elapsed=%v", key, size, objInfo.Size, time.Since(start))
+	return nil
 }
 
 func (fs *Fs) appendObject(name string, reader io.Reader, size int64) error {
+	start := time.Now()
 	opCtx, cancel := fs.operationContext()
 	defer cancel()
 
@@ -716,8 +795,14 @@ func (fs *Fs) appendObject(name string, reader io.Reader, size int64) error {
 	if fs.appendClient != nil {
 		appendClient = fs.appendClient
 	}
-	_, err := appendClient.AppendObject(opCtx, fs.bucket, fs.objectKey(name), reader, size, opts)
-	return mapMinioError(err)
+	key := fs.objectKey(name)
+	objInfo, err := appendClient.AppendObject(opCtx, fs.bucket, key, reader, size, opts)
+	if err != nil {
+		fs.perfLog("⏱️ [AppendObject] key=%s, size=%d, elapsed=%v, err=%v", key, size, time.Since(start), err)
+		return mapMinioError(err)
+	}
+	fs.perfLog("⏱️ [AppendObject] key=%s, size=%d, uploaded=%d, elapsed=%v", key, size, objInfo.Size, time.Since(start))
+	return nil
 }
 
 func (fs *Fs) composeObjects(dst string, srcs ...minio.CopySrcOptions) error {
@@ -725,14 +810,25 @@ func (fs *Fs) composeObjects(dst string, srcs ...minio.CopySrcOptions) error {
 }
 
 func (fs *Fs) composeObjectByKey(dstKey string, srcs ...minio.CopySrcOptions) error {
+	start := time.Now()
 	opCtx, cancel := fs.operationContext()
 	defer cancel()
+
+	srcKeys := make([]string, len(srcs))
+	for i, src := range srcs {
+		srcKeys[i] = src.Object
+	}
 
 	_, err := fs.client.ComposeObject(opCtx, minio.CopyDestOptions{
 		Bucket: fs.bucket,
 		Object: dstKey,
 	}, srcs...)
-	return mapMinioError(err)
+	if err != nil {
+		fs.perfLog("⏱️ [ComposeObject] dst=%s, srcs=%v, elapsed=%v, err=%v", dstKey, srcKeys, time.Since(start), err)
+		return mapMinioError(err)
+	}
+	fs.perfLog("⏱️ [ComposeObject] dst=%s, srcs=%v, elapsed=%v", dstKey, srcKeys, time.Since(start))
+	return nil
 }
 
 func mapKeys(values map[string]struct{}) []string {
