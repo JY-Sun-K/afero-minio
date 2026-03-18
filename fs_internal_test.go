@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -209,6 +210,146 @@ func TestCopyUsesReadFromToAggregateSequentialWrites(t *testing.T) {
 	}
 	if stats.gets != 0 {
 		t.Fatalf("expected no object rewrite reads, got %+v", stats)
+	}
+}
+
+func TestCopyBetweenMinioFilesUsesServerSideCopy(t *testing.T) {
+	transport := newFakeS3Transport()
+	transport.setObject("unit-test-bucket", "src.bin", []byte("copy payload"))
+
+	fs := newFakeTransportFs(t, context.Background(), transport, DefaultOptions())
+
+	src, err := fs.Open("src.bin")
+	if err != nil {
+		t.Fatalf("Open source failed: %v", err)
+	}
+	defer src.Close()
+
+	dst, err := fs.Create("dst.bin")
+	if err != nil {
+		t.Fatalf("Create destination failed: %v", err)
+	}
+	defer dst.Close()
+
+	transport.resetCounts()
+
+	n, err := io.Copy(dst, src)
+	if err != nil {
+		t.Fatalf("io.Copy failed: %v", err)
+	}
+	if n != int64(len("copy payload")) {
+		t.Fatalf("expected %d bytes copied, got %d", len("copy payload"), n)
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.copies != 1 {
+		t.Fatalf("expected single server-side copy, got %+v", stats)
+	}
+	if stats.gets != 0 || stats.puts != 0 {
+		t.Fatalf("expected no streaming get/put requests, got %+v", stats)
+	}
+
+	data, err := afero.ReadFile(fs, "dst.bin")
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if string(data) != "copy payload" {
+		t.Fatalf("unexpected copied data %q", string(data))
+	}
+}
+
+func TestCopyBetweenMinioFilesWithSourceOffsetFallsBackToStreaming(t *testing.T) {
+	transport := newFakeS3Transport()
+	transport.setObject("unit-test-bucket", "src-offset.bin", []byte("abcdef"))
+
+	fs := newFakeTransportFs(t, context.Background(), transport, DefaultOptions())
+
+	src, err := fs.Open("src-offset.bin")
+	if err != nil {
+		t.Fatalf("Open source failed: %v", err)
+	}
+	defer src.Close()
+
+	if _, err := src.Seek(2, io.SeekStart); err != nil {
+		t.Fatalf("Seek failed: %v", err)
+	}
+
+	dst, err := fs.Create("dst-offset.bin")
+	if err != nil {
+		t.Fatalf("Create destination failed: %v", err)
+	}
+	defer dst.Close()
+
+	transport.resetCounts()
+
+	n, err := io.Copy(dst, src)
+	if err != nil {
+		t.Fatalf("io.Copy failed: %v", err)
+	}
+	if n != int64(len("cdef")) {
+		t.Fatalf("expected %d bytes copied, got %d", len("cdef"), n)
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.copies != 0 {
+		t.Fatalf("expected source offset copy to avoid server-side copy, got %+v", stats)
+	}
+	if stats.gets == 0 || stats.puts == 0 {
+		t.Fatalf("expected streaming fallback to use get/put, got %+v", stats)
+	}
+
+	data, err := afero.ReadFile(fs, "dst-offset.bin")
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if string(data) != "cdef" {
+		t.Fatalf("unexpected copied data %q", string(data))
+	}
+}
+
+func TestCopyBetweenMinioFilesToNonEmptyTargetFallsBackToStreaming(t *testing.T) {
+	transport := newFakeS3Transport()
+	transport.setObject("unit-test-bucket", "src-nonempty.bin", []byte("xyz"))
+	transport.setObject("unit-test-bucket", "dst-nonempty.bin", []byte("12345"))
+
+	fs := newFakeTransportFs(t, context.Background(), transport, DefaultOptions())
+
+	src, err := fs.Open("src-nonempty.bin")
+	if err != nil {
+		t.Fatalf("Open source failed: %v", err)
+	}
+	defer src.Close()
+
+	dst, err := fs.OpenFile("dst-nonempty.bin", os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile destination failed: %v", err)
+	}
+	defer dst.Close()
+
+	transport.resetCounts()
+
+	n, err := io.Copy(dst, src)
+	if err != nil {
+		t.Fatalf("io.Copy failed: %v", err)
+	}
+	if n != int64(len("xyz")) {
+		t.Fatalf("expected %d bytes copied, got %d", len("xyz"), n)
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.copies != 0 {
+		t.Fatalf("expected non-empty target copy to avoid server-side copy, got %+v", stats)
+	}
+	if stats.gets == 0 || stats.puts == 0 {
+		t.Fatalf("expected streaming fallback to use get/put, got %+v", stats)
+	}
+
+	data, err := afero.ReadFile(fs, "dst-nonempty.bin")
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if string(data) != "xyz45" {
+		t.Fatalf("unexpected copied data %q", string(data))
 	}
 }
 
@@ -470,6 +611,7 @@ type fakeS3Transport struct {
 	appendCount               int
 	getCount                  int
 	headCount                 int
+	copyCount                 int
 }
 
 func newFakeS3Transport() *fakeS3Transport {
@@ -535,6 +677,15 @@ func (t *fakeS3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if t.putStatus != 0 {
 			return fakeErrorResponse(req, t.putStatus, "InternalError"), nil
 		}
+		if copySource := req.Header.Get("X-Amz-Copy-Source"); copySource != "" {
+			if err := t.copyObject(bucket, key, copySource); err != nil {
+				return nil, err
+			}
+			return fakeHTTPResponse(req, http.StatusOK, `<CopyObjectResult><LastModified>1970-01-01T00:00:00Z</LastModified><ETag>"etag"</ETag></CopyObjectResult>`, map[string]string{
+				"Content-Type": "application/xml",
+				"ETag":         `"etag"`,
+			}), nil
+		}
 		payload, err := readRequestPayload(req)
 		if err != nil {
 			return nil, err
@@ -581,6 +732,30 @@ func (t *fakeS3Transport) appendObject(bucket, key, offsetHeader string, payload
 	current = append(current, payload...)
 	t.objects[fullKey] = current
 	return len(current), nil
+}
+
+func (t *fakeS3Transport) copyObject(dstBucket, dstKey, copySource string) error {
+	source := strings.TrimPrefix(copySource, "/")
+	if idx := strings.IndexByte(source, '?'); idx >= 0 {
+		source = source[:idx]
+	}
+
+	source, err := url.PathUnescape(source)
+	if err != nil {
+		return err
+	}
+
+	srcBucket, srcKey := splitBucketAndKey("/" + source)
+	data, ok := t.getObject(srcBucket, srcKey)
+	if !ok {
+		return fmt.Errorf("copy source not found: %s/%s", srcBucket, srcKey)
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.copyCount++
+	t.objects[dstBucket+"/"+dstKey] = data
+	return nil
 }
 
 func (t *fakeS3Transport) getObject(bucket, key string) ([]byte, bool) {
@@ -630,6 +805,7 @@ func (t *fakeS3Transport) resetCounts() {
 	t.appendCount = 0
 	t.getCount = 0
 	t.headCount = 0
+	t.copyCount = 0
 }
 
 type requestCounts struct {
@@ -637,6 +813,7 @@ type requestCounts struct {
 	appends int
 	gets    int
 	heads   int
+	copies  int
 }
 
 type recordingTransport struct {
@@ -689,6 +866,7 @@ func (t *fakeS3Transport) snapshotCounts() requestCounts {
 		appends: t.appendCount,
 		gets:    t.getCount,
 		heads:   t.headCount,
+		copies:  t.copyCount,
 	}
 }
 
@@ -895,11 +1073,23 @@ func applyRange(data []byte, header string) ([]byte, int, map[string]string, err
 		return data, http.StatusOK, headers, nil
 	}
 
-	var start, end int
-	if _, err := fmt.Sscanf(header, "bytes=%d-%d", &start, &end); err != nil {
-		return nil, 0, nil, err
+	var (
+		start int
+		end   = len(data) - 1
+	)
+
+	switch {
+	case strings.HasSuffix(header, "-"):
+		if _, err := fmt.Sscanf(header, "bytes=%d-", &start); err != nil {
+			return nil, 0, nil, err
+		}
+	default:
+		if _, err := fmt.Sscanf(header, "bytes=%d-%d", &start, &end); err != nil {
+			return nil, 0, nil, err
+		}
 	}
-	if end == 0 || end >= len(data) {
+
+	if end >= len(data) {
 		end = len(data) - 1
 	}
 	if start < 0 || start >= len(data) || start > end {

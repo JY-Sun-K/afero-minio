@@ -162,6 +162,41 @@ func (o *minioFileResource) ReadAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
+func (o *minioFileResource) streamFromOffset(off int64) (io.Reader, func(), error) {
+	if off < 0 {
+		return nil, func() {}, ErrNegativeOffset
+	}
+
+	size, err := o.Size()
+	if err != nil {
+		return nil, func() {}, err
+	}
+	if off >= size {
+		return bytes.NewReader(nil), func() {}, nil
+	}
+
+	if o.tempFile != nil {
+		return io.NewSectionReader(o.tempFile, off, size-off), func() {}, nil
+	}
+
+	opts := minio.GetObjectOptions{}
+	if off > 0 {
+		if err := opts.SetRange(off, 0); err != nil {
+			return nil, func() {}, err
+		}
+	}
+
+	reader, cancel, err := o.fs.getObjectReader(o.name, opts)
+	if err != nil {
+		return nil, func() {}, err
+	}
+
+	return reader, func() {
+		_ = reader.Close()
+		cancel()
+	}, nil
+}
+
 func (o *minioFileResource) Append(b []byte) (int, error) {
 	size, err := o.Size()
 	if err != nil {

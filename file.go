@@ -20,6 +20,8 @@ type MinioFile struct {
 	resource  *minioFileResource
 }
 
+var _ io.WriterTo = (*MinioFile)(nil)
+
 func NewMinioFile(ctx context.Context, fs *Fs, openFlags int, fileMode os.FileMode, name string) *MinioFile {
 	return &MinioFile{
 		openFlags: openFlags,
@@ -200,6 +202,95 @@ func (o *MinioFile) ReadFrom(src io.Reader) (int64, error) {
 			return written, er
 		}
 	}
+}
+
+func (o *MinioFile) WriteTo(dst io.Writer) (int64, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.closed {
+		return 0, ErrFileClosed
+	}
+	if o.openFlags&os.O_WRONLY != 0 {
+		return 0, ErrWriteOnlyFile
+	}
+
+	if dstFile, ok := dst.(*MinioFile); ok {
+		if dstFile == o {
+			return 0, ErrNotSupported
+		}
+		if copied, usedFastPath, err := o.tryServerSideCopyLocked(dstFile); usedFastPath {
+			return copied, err
+		}
+	}
+
+	return o.streamWriteToLocked(dst)
+}
+
+func (o *MinioFile) tryServerSideCopyLocked(dst *MinioFile) (int64, bool, error) {
+	if o.fhOffset != 0 || o.resource.tempFile != nil {
+		return 0, false, nil
+	}
+	if o.resource.fs != dst.resource.fs {
+		return 0, false, nil
+	}
+
+	srcKey := o.resource.fs.objectKey(o.resource.name)
+	dstKey := dst.resource.fs.objectKey(dst.resource.name)
+	if srcKey == dstKey {
+		return 0, false, nil
+	}
+
+	size, err := o.resource.Size()
+	if err != nil {
+		return 0, true, err
+	}
+
+	dst.mu.Lock()
+	defer dst.mu.Unlock()
+
+	if dst.closed {
+		return 0, true, ErrFileClosed
+	}
+	if dst.openFlags&os.O_RDONLY != 0 || dst.openFlags&(os.O_WRONLY|os.O_RDWR) == 0 {
+		return 0, true, ErrReadOnlyFile
+	}
+	if dst.resource.tempFile != nil {
+		return 0, false, nil
+	}
+	if dst.fhOffset != 0 {
+		return 0, false, nil
+	}
+
+	dstSize, err := dst.resource.Size()
+	if err != nil {
+		return 0, true, err
+	}
+	if dstSize != 0 {
+		return 0, false, nil
+	}
+
+	if err := o.resource.fs.copyObject(srcKey, dstKey); err != nil {
+		return 0, true, err
+	}
+
+	o.fhOffset = size
+	dst.fhOffset = size
+	dst.resource.currentSize = size
+	dst.resource.sizeKnown = true
+	return size, true, nil
+}
+
+func (o *MinioFile) streamWriteToLocked(dst io.Writer) (int64, error) {
+	reader, cleanup, err := o.resource.streamFromOffset(o.fhOffset)
+	if err != nil {
+		return 0, err
+	}
+	defer cleanup()
+
+	written, err := io.CopyBuffer(dst, reader, make([]byte, o.resource.fs.options.readFromChunkSize()))
+	o.fhOffset += written
+	return written, err
 }
 
 func (o *MinioFile) writeReadFromChunk(chunk []byte) (int, error) {
