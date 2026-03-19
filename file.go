@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"github.com/spf13/afero"
 )
 
 type MinioFile struct {
@@ -215,12 +217,14 @@ func (o *MinioFile) WriteTo(dst io.Writer) (int64, error) {
 		return 0, ErrWriteOnlyFile
 	}
 
-	if dstFile, ok := dst.(*MinioFile); ok {
-		if dstFile == o {
-			return 0, ErrNotSupported
-		}
-		if copied, usedFastPath, err := o.tryServerSideCopyLocked(dstFile); usedFastPath {
-			return copied, err
+	if basePathFile, ok := dst.(*afero.BasePathFile); ok {
+		if dstFile, ok := basePathFile.File.(*MinioFile); ok {
+			if dstFile == o {
+				return 0, ErrNotSupported
+			}
+			if copied, usedFastPath, err := o.tryServerSideCopyLocked(dstFile); usedFastPath {
+				return copied, err
+			}
 		}
 	}
 
