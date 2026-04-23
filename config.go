@@ -3,6 +3,7 @@ package miniofs
 import (
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -56,6 +57,9 @@ type Options struct {
 	AssumeNativeAppendSupported bool
 	NativeAppendChunkSize       uint64
 	StreamChunkSize             uint64
+	OptimisticWriteOpen         bool
+	StatCacheTTL                time.Duration
+	DeferEmptyObjectWrite       bool
 	// EnablePerfLog 启用性能日志输出（默认 false）
 	EnablePerfLog bool
 }
@@ -98,6 +102,9 @@ func (o Options) withDefaults() Options {
 	if shouldDefaultDirectoryMarkers(o) {
 		o.DirectoryMarkers = defaults.DirectoryMarkers
 	}
+	if o.TempDir == "" {
+		o.TempDir = os.TempDir()
+	}
 	return o
 }
 
@@ -121,7 +128,10 @@ func shouldDefaultDirectoryMarkers(o Options) bool {
 		o.AppendStrategy == "" &&
 		!o.AssumeNativeAppendSupported &&
 		o.NativeAppendChunkSize == 0 &&
-		o.StreamChunkSize == 0
+		o.StreamChunkSize == 0 &&
+		!o.OptimisticWriteOpen &&
+		o.StatCacheTTL == 0 &&
+		!o.DeferEmptyObjectWrite
 }
 
 func normalizePrefix(prefix string) string {

@@ -41,6 +41,183 @@ func TestReadFileUsesLiveGetObjectContext(t *testing.T) {
 	}
 }
 
+func TestReadFileUsesSingleHeadAndSingleGet(t *testing.T) {
+	transport := newFakeS3Transport()
+	transport.setObject("unit-test-bucket", "hello.txt", []byte("hello world"))
+
+	fs := newFakeTransportFs(t, context.Background(), transport, DefaultOptions())
+	transport.resetCounts()
+
+	data, err := afero.ReadFile(fs, "hello.txt")
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if string(data) != "hello world" {
+		t.Fatalf("unexpected data %q", string(data))
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.heads != 1 || stats.gets != 1 || stats.puts != 0 || stats.lists != 0 {
+		t.Fatalf("expected ReadFile to use 1 HEAD, 1 GET, 0 PUT, 0 list; got %+v", stats)
+	}
+}
+
+func TestSequentialSmallReadsReuseSingleGet(t *testing.T) {
+	transport := newFakeS3Transport()
+	transport.setObject("unit-test-bucket", "small.txt", []byte("abcdef"))
+
+	fs := newFakeTransportFs(t, context.Background(), transport, DefaultOptions())
+	f, err := fs.Open("small.txt")
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer f.Close()
+	transport.resetCounts()
+
+	var out strings.Builder
+	buf := make([]byte, 2)
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			out.Write(buf[:n])
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Read failed: %v", err)
+		}
+	}
+	if out.String() != "abcdef" {
+		t.Fatalf("unexpected data %q", out.String())
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.gets != 1 {
+		t.Fatalf("expected sequential small reads to reuse one GET, got %+v", stats)
+	}
+}
+
+func TestWriteFileExistingObjectDefaultPreservesImmediateTruncate(t *testing.T) {
+	transport := newFakeS3Transport()
+	transport.setObject("unit-test-bucket", "existing.txt", []byte("old"))
+
+	fs := newFakeTransportFs(t, context.Background(), transport, DefaultOptions())
+	transport.resetCounts()
+
+	if err := afero.WriteFile(fs, "existing.txt", []byte("new content"), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.heads != 1 || stats.puts != 2 || stats.gets != 0 {
+		t.Fatalf("expected default existing WriteFile to use 1 HEAD, 2 PUT, 0 GET; got %+v", stats)
+	}
+}
+
+func TestDeferEmptyObjectWriteAvoidsEmptyPutAndReadback(t *testing.T) {
+	transport := newFakeS3Transport()
+	transport.setObject("unit-test-bucket", "existing.txt", []byte("old"))
+
+	opts := DefaultOptions()
+	opts.DeferEmptyObjectWrite = true
+	fs := newFakeTransportFs(t, context.Background(), transport, opts)
+	transport.resetCounts()
+
+	if err := afero.WriteFile(fs, "existing.txt", []byte("new content"), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.heads != 1 || stats.puts != 1 || stats.gets != 0 {
+		t.Fatalf("expected deferred existing WriteFile to use 1 HEAD, 1 PUT, 0 GET; got %+v", stats)
+	}
+}
+
+func TestCreateCloseStillCreatesEmptyObject(t *testing.T) {
+	transport := newFakeS3Transport()
+
+	fs := newFakeTransportFs(t, context.Background(), transport, DefaultOptions())
+	transport.resetCounts()
+
+	f, err := fs.Create("empty.txt")
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.puts != 1 {
+		t.Fatalf("expected Create followed by Close to create one empty object, got %+v", stats)
+	}
+	data, ok := transport.getObject("unit-test-bucket", "empty.txt")
+	if !ok {
+		t.Fatal("expected empty object to exist")
+	}
+	if len(data) != 0 {
+		t.Fatalf("expected empty object, got %q", string(data))
+	}
+}
+
+func TestOptimisticWriteOpenSkipsCreateTruncatePrecheck(t *testing.T) {
+	transport := newFakeS3Transport()
+
+	opts := DefaultOptions()
+	opts.OptimisticWriteOpen = true
+	opts.DeferEmptyObjectWrite = true
+	fs := newFakeTransportFs(t, context.Background(), transport, opts)
+	transport.resetCounts()
+
+	if err := afero.WriteFile(fs, "new-fast.txt", []byte("fast"), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.heads != 0 || stats.lists != 0 || stats.puts != 1 {
+		t.Fatalf("expected optimistic WriteFile to use 0 HEAD/list and 1 PUT, got %+v", stats)
+	}
+}
+
+func TestCacheOnReadColdMissUsesStatCacheAndHotHitAvoidsBase(t *testing.T) {
+	transport := newFakeS3Transport()
+	transport.setObject("unit-test-bucket", "cached.txt", []byte("cached payload"))
+
+	opts := DefaultOptions()
+	opts.StatCacheTTL = time.Minute
+	fs := newFakeTransportFs(t, context.Background(), transport, opts)
+	cacheFs := afero.NewCacheOnReadFs(fs, afero.NewMemMapFs(), 0)
+	transport.resetCounts()
+
+	data, err := afero.ReadFile(cacheFs, "cached.txt")
+	if err != nil {
+		t.Fatalf("cold cache ReadFile failed: %v", err)
+	}
+	if string(data) != "cached payload" {
+		t.Fatalf("unexpected cold cache data %q", string(data))
+	}
+
+	stats := transport.snapshotCounts()
+	if stats.heads != 1 || stats.gets != 1 || stats.puts != 0 || stats.lists != 0 {
+		t.Fatalf("expected cold cache miss to use 1 HEAD, 1 GET, 0 PUT, 0 list; got %+v", stats)
+	}
+
+	transport.resetCounts()
+	data, err = afero.ReadFile(cacheFs, "cached.txt")
+	if err != nil {
+		t.Fatalf("hot cache ReadFile failed: %v", err)
+	}
+	if string(data) != "cached payload" {
+		t.Fatalf("unexpected hot cache data %q", string(data))
+	}
+
+	stats = transport.snapshotCounts()
+	if stats.heads != 0 || stats.gets != 0 || stats.puts != 0 || stats.lists != 0 {
+		t.Fatalf("expected hot cache hit to avoid base fs, got %+v", stats)
+	}
+}
+
 func TestListObjectsUsesOperationTimeout(t *testing.T) {
 	parentCtx, cancelParent := context.WithCancel(context.Background())
 	defer cancelParent()
@@ -612,6 +789,7 @@ type fakeS3Transport struct {
 	getCount                  int
 	headCount                 int
 	copyCount                 int
+	listCount                 int
 }
 
 func newFakeS3Transport() *fakeS3Transport {
@@ -641,6 +819,7 @@ func (t *fakeS3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	if req.URL.Query().Get("list-type") == "2" {
+		t.incrementListCount()
 		if t.blockListUntilContextDone {
 			<-req.Context().Done()
 			return nil, req.Context().Err()
@@ -798,6 +977,12 @@ func (t *fakeS3Transport) incrementHeadCount() {
 	t.headCount++
 }
 
+func (t *fakeS3Transport) incrementListCount() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.listCount++
+}
+
 func (t *fakeS3Transport) resetCounts() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -806,6 +991,7 @@ func (t *fakeS3Transport) resetCounts() {
 	t.getCount = 0
 	t.headCount = 0
 	t.copyCount = 0
+	t.listCount = 0
 }
 
 type requestCounts struct {
@@ -814,6 +1000,7 @@ type requestCounts struct {
 	gets    int
 	heads   int
 	copies  int
+	lists   int
 }
 
 type recordingTransport struct {
@@ -867,6 +1054,7 @@ func (t *fakeS3Transport) snapshotCounts() requestCounts {
 		gets:    t.getCount,
 		heads:   t.headCount,
 		copies:  t.copyCount,
+		lists:   t.listCount,
 	}
 }
 

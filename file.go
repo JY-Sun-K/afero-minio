@@ -24,15 +24,19 @@ type MinioFile struct {
 
 var _ io.WriterTo = (*MinioFile)(nil)
 
-func NewMinioFile(ctx context.Context, fs *Fs, openFlags int, fileMode os.FileMode, name string) *MinioFile {
+func NewMinioFile(ctx context.Context, fs *Fs, openFlags int, fileMode os.FileMode, name string, initialInfo ...os.FileInfo) *MinioFile {
+	resource := &minioFileResource{
+		ctx:      ctx,
+		fs:       fs,
+		name:     name,
+		fileMode: fileMode,
+	}
+	if len(initialInfo) > 0 && initialInfo[0] != nil {
+		resource.applyFileInfo(initialInfo[0])
+	}
 	return &MinioFile{
 		openFlags: openFlags,
-		resource: &minioFileResource{
-			ctx:      ctx,
-			fs:       fs,
-			name:     name,
-			fileMode: fileMode,
-		},
+		resource:  resource,
 	}
 }
 
@@ -78,6 +82,7 @@ func (o *MinioFile) Seek(offset int64, whence int) (int64, error) {
 	if next < 0 {
 		return 0, ErrNegativeOffset
 	}
+	o.resource.closeReadStream()
 	o.fhOffset = next
 	return next, nil
 }
@@ -93,7 +98,7 @@ func (o *MinioFile) Read(p []byte) (int, error) {
 		return 0, ErrWriteOnlyFile
 	}
 
-	n, err := o.resource.ReadAt(p, o.fhOffset)
+	n, err := o.resource.Read(p, o.fhOffset)
 	o.fhOffset += int64(n)
 	return n, err
 }
@@ -130,6 +135,7 @@ func (o *MinioFile) Write(p []byte) (int, error) {
 		n   int
 		err error
 	)
+	o.resource.closeReadStream()
 	if o.openFlags&os.O_APPEND != 0 {
 		n, err = o.resource.Append(p)
 		if err != nil {
@@ -165,6 +171,7 @@ func (o *MinioFile) WriteAt(p []byte, off int64) (int, error) {
 		return 0, ErrAppendNotSupported
 	}
 
+	o.resource.closeReadStream()
 	return o.resource.WriteAt(p, off)
 }
 
@@ -178,6 +185,7 @@ func (o *MinioFile) ReadFrom(src io.Reader) (int64, error) {
 	if o.openFlags&os.O_RDONLY != 0 || o.openFlags&(os.O_WRONLY|os.O_RDWR) == 0 {
 		return 0, ErrReadOnlyFile
 	}
+	o.resource.closeReadStream()
 
 	buf := make([]byte, o.resource.fs.options.readFromChunkSize())
 	var written int64
@@ -215,6 +223,15 @@ func (o *MinioFile) WriteTo(dst io.Writer) (int64, error) {
 	}
 	if o.openFlags&os.O_WRONLY != 0 {
 		return 0, ErrWriteOnlyFile
+	}
+
+	if dstFile, ok := dst.(*MinioFile); ok {
+		if dstFile == o {
+			return 0, ErrNotSupported
+		}
+		if copied, usedFastPath, err := o.tryServerSideCopyLocked(dstFile); usedFastPath {
+			return copied, err
+		}
 	}
 
 	if basePathFile, ok := dst.(*afero.BasePathFile); ok {
@@ -282,6 +299,8 @@ func (o *MinioFile) tryServerSideCopyLocked(dst *MinioFile) (int64, bool, error)
 	dst.fhOffset = size
 	dst.resource.currentSize = size
 	dst.resource.sizeKnown = true
+	dst.resource.clearPendingEmptyObject()
+	dst.resource.statInfo = nil
 	return size, true, nil
 }
 
@@ -510,6 +529,7 @@ func (o *MinioFile) Truncate(size int64) error {
 		return ErrReadOnlyFile
 	}
 
+	o.resource.closeReadStream()
 	if err := o.resource.Truncate(size); err != nil {
 		return err
 	}

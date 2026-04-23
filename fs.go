@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -24,6 +25,13 @@ type Fs struct {
 	bucket       string
 	separator    string
 	options      Options
+	statCacheMu  sync.Mutex
+	statCache    map[string]statCacheEntry
+}
+
+type statCacheEntry struct {
+	info      minio.ObjectInfo
+	expiresAt time.Time
 }
 
 // perfLog 性能日志输出，仅在 EnablePerfLog 为 true 时打印
@@ -102,6 +110,9 @@ func newFs(ctx context.Context, client *minio.Client, appendClient *minio.Client
 		bucket:       bucket,
 		separator:    "/",
 		options:      opts,
+	}
+	if opts.StatCacheTTL > 0 {
+		fs.statCache = make(map[string]statCacheEntry)
 	}
 
 	if opts.AppName != "" {
@@ -195,9 +206,19 @@ func (fs *Fs) OpenFile(name string, flag int, fileMode os.FileMode) (afero.File,
 	start := time.Now()
 	name = fs.normalizeName(name)
 
-	statStart := time.Now()
-	info, err := fs.Stat(name)
-	fs.perfLog("⏱️ [OpenFile.Stat] name=%s, elapsed=%v, err=%v", name, time.Since(statStart), err)
+	var (
+		info os.FileInfo
+		err  error
+	)
+	skipStat := fs.shouldOptimisticWriteOpen(flag)
+	if !skipStat {
+		statStart := time.Now()
+		info, err = fs.Stat(name)
+		fs.perfLog("⏱️ [OpenFile.Stat] name=%s, elapsed=%v, err=%v", name, time.Since(statStart), err)
+	} else {
+		err = os.ErrNotExist
+		fs.perfLog("⏱️ [OpenFile.Stat] name=%s, skipped optimistic write open", name)
+	}
 
 	pathExists := err == nil
 	isDir := pathExists && info.IsDir()
@@ -211,7 +232,7 @@ func (fs *Fs) OpenFile(name string, flag int, fileMode os.FileMode) (afero.File,
 			return nil, NewPathError("open", name, os.ErrInvalid)
 		}
 		fs.perfLog("⏱️ [OpenFile] name=%s (dir), total elapsed=%v", name, time.Since(start))
-		return NewMinioFile(fs.ctx, fs, flag, fileMode, name), nil
+		return NewMinioFile(fs.ctx, fs, flag, fileMode, name, info), nil
 	}
 
 	if flag&os.O_CREATE != 0 {
@@ -219,30 +240,45 @@ func (fs *Fs) OpenFile(name string, flag int, fileMode os.FileMode) (afero.File,
 			return nil, NewPathError("open", name, os.ErrExist)
 		}
 		if !fileExists {
-			putStart := time.Now()
-			if err := fs.putEmptyObject(name, "application/octet-stream"); err != nil {
-				return nil, NewPathError("create", name, err)
+			if !fs.options.DeferEmptyObjectWrite && flag&os.O_TRUNC == 0 {
+				putStart := time.Now()
+				if err := fs.putEmptyObject(name, "application/octet-stream"); err != nil {
+					return nil, NewPathError("create", name, err)
+				}
+				fs.perfLog("⏱️ [OpenFile.putEmptyObject] name=%s, elapsed=%v", name, time.Since(putStart))
 			}
-			fs.perfLog("⏱️ [OpenFile.putEmptyObject] name=%s, elapsed=%v", name, time.Since(putStart))
 			fileExists = true
 		}
 	} else if !fileExists {
 		return nil, NewPathError("open", name, os.ErrNotExist)
 	}
 
-	file := NewMinioFile(fs.ctx, fs, flag, fileMode, name)
+	file := NewMinioFile(fs.ctx, fs, flag, fileMode, name, info)
 
 	if flag&os.O_TRUNC != 0 {
-		truncStart := time.Now()
-		if err := file.Truncate(0); err != nil {
+		if flag&(os.O_WRONLY|os.O_RDWR) == 0 {
+			return nil, NewPathError("truncate", name, ErrReadOnlyFile)
+		}
+		if fs.options.DeferEmptyObjectWrite {
+			file.resource.markPendingEmptyObject()
+		} else if err := file.Truncate(0); err != nil {
 			_ = file.Close()
 			return nil, NewPathError("truncate", name, err)
 		}
-		fs.perfLog("⏱️ [OpenFile.Truncate] name=%s, elapsed=%v", name, time.Since(truncStart))
+	} else if flag&os.O_CREATE != 0 && !pathExists && fs.options.DeferEmptyObjectWrite {
+		file.resource.markPendingEmptyObject()
 	}
 
 	fs.perfLog("⏱️ [OpenFile] name=%s, total elapsed=%v", name, time.Since(start))
 	return file, nil
+}
+
+func (fs *Fs) shouldOptimisticWriteOpen(flag int) bool {
+	return fs.options.OptimisticWriteOpen &&
+		flag&os.O_CREATE != 0 &&
+		flag&os.O_TRUNC != 0 &&
+		flag&os.O_EXCL == 0 &&
+		flag&(os.O_WRONLY|os.O_RDWR) != 0
 }
 
 func (fs *Fs) Mkdir(name string, _ os.FileMode) error {
@@ -601,6 +637,60 @@ func (fs *Fs) operationContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(fs.ctx, fs.options.OperationTimeout)
 }
 
+func (fs *Fs) getCachedStat(key string, opts minio.StatObjectOptions) (minio.ObjectInfo, bool) {
+	if fs.options.StatCacheTTL <= 0 || !isCacheableStatOptions(opts) || fs.statCache == nil {
+		return minio.ObjectInfo{}, false
+	}
+
+	now := time.Now()
+	fs.statCacheMu.Lock()
+	defer fs.statCacheMu.Unlock()
+
+	entry, ok := fs.statCache[key]
+	if !ok {
+		return minio.ObjectInfo{}, false
+	}
+	if now.After(entry.expiresAt) {
+		delete(fs.statCache, key)
+		return minio.ObjectInfo{}, false
+	}
+	return entry.info, true
+}
+
+func (fs *Fs) cacheStat(key string, opts minio.StatObjectOptions, info minio.ObjectInfo) {
+	if fs.options.StatCacheTTL <= 0 || !isCacheableStatOptions(opts) || fs.statCache == nil {
+		return
+	}
+
+	fs.statCacheMu.Lock()
+	defer fs.statCacheMu.Unlock()
+	fs.statCache[key] = statCacheEntry{
+		info:      info,
+		expiresAt: time.Now().Add(fs.options.StatCacheTTL),
+	}
+}
+
+func (fs *Fs) invalidateStatCache(keys ...string) {
+	if fs.statCache == nil {
+		return
+	}
+
+	fs.statCacheMu.Lock()
+	defer fs.statCacheMu.Unlock()
+	for _, key := range keys {
+		delete(fs.statCache, key)
+	}
+}
+
+func isCacheableStatOptions(opts minio.StatObjectOptions) bool {
+	return !opts.Checksum &&
+		opts.VersionID == "" &&
+		opts.PartNumber == 0 &&
+		opts.ServerSideEncryption == nil &&
+		opts.Internal == (minio.AdvancedGetOptions{}) &&
+		len(opts.Header()) == 0
+}
+
 func (fs *Fs) listObjects(prefix string, recursive bool, maxKeys int) (<-chan minio.ObjectInfo, context.CancelFunc) {
 	opCtx, cancel := fs.operationContext()
 	return fs.client.ListObjects(opCtx, fs.bucket, minio.ListObjectsOptions{
@@ -616,6 +706,11 @@ func (fs *Fs) statObjectByKey(key string) (minio.ObjectInfo, error) {
 
 func (fs *Fs) statObjectByKeyWithOptions(key string, opts minio.StatObjectOptions) (minio.ObjectInfo, error) {
 	start := time.Now()
+	if info, ok := fs.getCachedStat(key, opts); ok {
+		fs.perfLog("⏱️ [StatObject.CacheHit] key=%s, size=%d, elapsed=%v", key, info.Size, time.Since(start))
+		return info, nil
+	}
+
 	opCtx, cancel := fs.operationContext()
 	defer cancel()
 
@@ -626,6 +721,7 @@ func (fs *Fs) statObjectByKeyWithOptions(key string, opts minio.StatObjectOption
 		return minio.ObjectInfo{}, mappedErr
 	}
 	fs.perfLog("⏱️ [StatObject] key=%s, size=%d, elapsed=%v", key, info.Size, time.Since(start))
+	fs.cacheStat(key, opts, info)
 	return info, nil
 }
 
@@ -662,6 +758,7 @@ func (fs *Fs) removeObjectByKey(key string) error {
 		fs.perfLog("⏱️ [RemoveObject] key=%s, elapsed=%v, err=%v", key, time.Since(start), err)
 		return mapMinioError(err)
 	}
+	fs.invalidateStatCache(key)
 	fs.perfLog("⏱️ [RemoveObject] key=%s, elapsed=%v", key, time.Since(start))
 	return nil
 }
@@ -682,6 +779,7 @@ func (fs *Fs) copyObject(srcKey, dstKey string) error {
 		fs.perfLog("⏱️ [CopyObject] src=%s, dst=%s, elapsed=%v, err=%v", srcKey, dstKey, time.Since(start), err)
 		return mapMinioError(err)
 	}
+	fs.invalidateStatCache(dstKey)
 	fs.perfLog("⏱️ [CopyObject] src=%s, dst=%s, elapsed=%v", srcKey, dstKey, time.Since(start))
 	return nil
 }
@@ -778,6 +876,7 @@ func (fs *Fs) putObjectByKey(key string, reader io.Reader, size int64, opts mini
 		fs.perfLog("⏱️ [PutObject] key=%s, size=%d, elapsed=%v, err=%v", key, size, time.Since(start), err)
 		return mapMinioError(err)
 	}
+	fs.invalidateStatCache(key)
 	fs.perfLog("⏱️ [PutObject] key=%s, size=%d, uploaded=%d, elapsed=%v", key, size, objInfo.Size, time.Since(start))
 	return nil
 }
@@ -801,6 +900,7 @@ func (fs *Fs) appendObject(name string, reader io.Reader, size int64) error {
 		fs.perfLog("⏱️ [AppendObject] key=%s, size=%d, elapsed=%v, err=%v", key, size, time.Since(start), err)
 		return mapMinioError(err)
 	}
+	fs.invalidateStatCache(key)
 	fs.perfLog("⏱️ [AppendObject] key=%s, size=%d, uploaded=%d, elapsed=%v", key, size, objInfo.Size, time.Since(start))
 	return nil
 }
@@ -827,6 +927,7 @@ func (fs *Fs) composeObjectByKey(dstKey string, srcs ...minio.CopySrcOptions) er
 		fs.perfLog("⏱️ [ComposeObject] dst=%s, srcs=%v, elapsed=%v, err=%v", dstKey, srcKeys, time.Since(start), err)
 		return mapMinioError(err)
 	}
+	fs.invalidateStatCache(dstKey)
 	fs.perfLog("⏱️ [ComposeObject] dst=%s, srcs=%v, elapsed=%v", dstKey, srcKeys, time.Since(start))
 	return nil
 }

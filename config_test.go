@@ -31,6 +31,16 @@ func TestDefaultOptions(t *testing.T) {
 	if opts.StreamChunkSize != 5<<20 {
 		t.Fatalf("expected default stream chunk size 5 MiB, got %d", opts.StreamChunkSize)
 	}
+
+	if opts.OptimisticWriteOpen {
+		t.Fatal("expected OptimisticWriteOpen to be disabled by default")
+	}
+	if opts.StatCacheTTL != 0 {
+		t.Fatalf("expected StatCacheTTL to be disabled by default, got %v", opts.StatCacheTTL)
+	}
+	if opts.DeferEmptyObjectWrite {
+		t.Fatal("expected DeferEmptyObjectWrite to be disabled by default")
+	}
 }
 
 func TestOptionsWithDefaults(t *testing.T) {

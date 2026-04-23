@@ -22,12 +22,70 @@ type minioFileResource struct {
 
 	currentSize int64
 	sizeKnown   bool
+	statInfo    *FileInfo
 
 	tempFile  *os.File
 	tempPath  string
 	tempDirty bool
 
+	pendingEmptyObject bool
+	readStream         io.Reader
+	readStreamCleanup  func()
+	readStreamOffset   int64
+
 	closed bool
+}
+
+func (o *minioFileResource) applyFileInfo(info os.FileInfo) {
+	if info == nil {
+		return
+	}
+
+	if fi, ok := info.(*FileInfo); ok {
+		copied := *fi
+		o.statInfo = &copied
+	} else {
+		o.statInfo = &FileInfo{
+			name:     o.name,
+			size:     info.Size(),
+			updated:  info.ModTime(),
+			isDir:    info.IsDir(),
+			fileMode: info.Mode(),
+		}
+	}
+	o.currentSize = info.Size()
+	o.sizeKnown = true
+}
+
+func (o *minioFileResource) markPendingEmptyObject() {
+	o.closeReadStream()
+	mode := o.fileMode
+	if mode == 0 {
+		mode = defaultFileMode
+	}
+	o.pendingEmptyObject = true
+	o.currentSize = 0
+	o.sizeKnown = true
+	o.statInfo = &FileInfo{
+		name:     o.name,
+		size:     0,
+		updated:  time.Now(),
+		isDir:    false,
+		fileMode: mode,
+	}
+}
+
+func (o *minioFileResource) clearPendingEmptyObject() {
+	o.pendingEmptyObject = false
+}
+
+func (o *minioFileResource) closeReadStream() {
+	if o.readStreamCleanup != nil {
+		o.readStreamCleanup()
+	}
+	o.readStream = nil
+	o.readStreamCleanup = nil
+	o.readStreamOffset = 0
 }
 
 func (o *minioFileResource) Close() error {
@@ -35,6 +93,7 @@ func (o *minioFileResource) Close() error {
 	if o.closed {
 		return nil
 	}
+	o.closeReadStream()
 
 	if err := o.Sync(); err != nil {
 		return err
@@ -55,7 +114,22 @@ func (o *minioFileResource) Close() error {
 
 func (o *minioFileResource) Sync() error {
 	start := time.Now()
-	if o.tempFile == nil || !o.tempDirty {
+	if o.tempFile == nil {
+		if !o.pendingEmptyObject {
+			o.fs.perfLog("⏱️ [Sync] name=%s, skipped (no tempFile or pending object), elapsed=%v", o.name, time.Since(start))
+			return nil
+		}
+		putStart := time.Now()
+		if err := o.fs.putEmptyObject(o.name, "application/octet-stream"); err != nil {
+			return err
+		}
+		o.clearPendingEmptyObject()
+		o.currentSize = 0
+		o.sizeKnown = true
+		o.fs.perfLog("⏱️ [Sync.putEmptyObject] name=%s, elapsed=%v", o.name, time.Since(putStart))
+		return nil
+	}
+	if !o.tempDirty {
 		o.fs.perfLog("⏱️ [Sync] name=%s, skipped (no tempFile or not dirty), elapsed=%v", o.name, time.Since(start))
 		return nil
 	}
@@ -78,6 +152,7 @@ func (o *minioFileResource) Sync() error {
 	o.fs.perfLog("⏱️ [Sync.putObject] name=%s, size=%d, elapsed=%v", o.name, info.Size(), time.Since(putStart))
 
 	o.tempDirty = false
+	o.clearPendingEmptyObject()
 	o.currentSize = info.Size()
 	o.sizeKnown = true
 	_, _ = o.tempFile.Seek(0, io.SeekStart)
@@ -98,6 +173,9 @@ func (o *minioFileResource) Stat() (os.FileInfo, error) {
 			isDir:    false,
 			fileMode: o.fileMode,
 		}, nil
+	}
+	if o.statInfo != nil {
+		return o.statInfo, nil
 	}
 
 	return o.fs.Stat(o.name)
@@ -131,6 +209,49 @@ func (o *minioFileResource) Size() (int64, error) {
 	o.currentSize = info.Size
 	o.sizeKnown = true
 	return info.Size, nil
+}
+
+func (o *minioFileResource) Read(p []byte, off int64) (int, error) {
+	start := time.Now()
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if off < 0 {
+		return 0, ErrNegativeOffset
+	}
+
+	if o.tempFile != nil {
+		n, err := o.tempFile.ReadAt(p, off)
+		o.fs.perfLog("⏱️ [Read] name=%s, off=%d, len=%d, n=%d, tempFile=true, elapsed=%v", o.name, off, len(p), n, time.Since(start))
+		return n, err
+	}
+
+	size, err := o.Size()
+	if err != nil {
+		return 0, err
+	}
+	if off >= size {
+		return 0, io.EOF
+	}
+
+	if o.readStream == nil || o.readStreamOffset != off {
+		o.closeReadStream()
+		reader, cleanup, err := o.streamFromOffset(off)
+		if err != nil {
+			return 0, err
+		}
+		o.readStream = reader
+		o.readStreamCleanup = cleanup
+		o.readStreamOffset = off
+	}
+
+	n, err := o.readStream.Read(p)
+	o.readStreamOffset += int64(n)
+	if err == io.EOF {
+		o.closeReadStream()
+	}
+	o.fs.perfLog("⏱️ [Read] name=%s, off=%d, len=%d, n=%d, elapsed=%v, err=%v", o.name, off, len(p), n, time.Since(start), err)
+	return n, err
 }
 
 func (o *minioFileResource) ReadAt(p []byte, off int64) (int, error) {
@@ -309,8 +430,10 @@ func (o *minioFileResource) writeDirect(b []byte, off int64) (int, error) {
 			return 0, err
 		}
 		o.fs.perfLog("⏱️ [writeDirect.putObject] name=%s, size=%d (new file), putElapsed=%v, totalElapsed=%v", o.name, len(b), time.Since(putStart), time.Since(start))
+		o.clearPendingEmptyObject()
 		o.currentSize = int64(len(b))
 		o.sizeKnown = true
+		o.statInfo = nil
 		return len(b), nil
 	}
 
@@ -339,6 +462,8 @@ func (o *minioFileResource) writeDirect(b []byte, off int64) (int, error) {
 
 	o.currentSize = int64(len(existing))
 	o.sizeKnown = true
+	o.clearPendingEmptyObject()
+	o.statInfo = nil
 	o.fs.perfLog("⏱️ [writeDirect] name=%s, off=%d, len=%d, totalElapsed=%v", o.name, off, len(b), time.Since(start))
 	return len(b), nil
 }
@@ -354,6 +479,8 @@ func (o *minioFileResource) writeTempAt(b []byte, off int64) (int, error) {
 	}
 	o.sizeKnown = true
 	o.tempDirty = true
+	o.clearPendingEmptyObject()
+	o.statInfo = nil
 	return len(b), nil
 }
 
@@ -392,6 +519,8 @@ func (o *minioFileResource) composeAppend(b []byte) (int, error) {
 
 	o.currentSize = currentSize + int64(len(b))
 	o.sizeKnown = true
+	o.clearPendingEmptyObject()
+	o.statInfo = nil
 	o.fs.perfLog("⏱️ [composeAppend] name=%s, appendLen=%d, newSize=%d, totalElapsed=%v", o.name, len(b), o.currentSize, time.Since(start))
 	return len(b), nil
 }
@@ -405,6 +534,8 @@ func (o *minioFileResource) nativeAppend(b []byte) (int, error) {
 
 	o.currentSize += int64(len(b))
 	o.sizeKnown = true
+	o.clearPendingEmptyObject()
+	o.statInfo = nil
 	o.fs.perfLog("⏱️ [nativeAppend] name=%s, appendLen=%d, newSize=%d, elapsed=%v", o.name, len(b), o.currentSize, time.Since(start))
 	return len(b), nil
 }
@@ -432,12 +563,26 @@ func (o *minioFileResource) Truncate(size int64) error {
 	}
 
 	if size == 0 {
+		if o.fs.options.DeferEmptyObjectWrite {
+			o.markPendingEmptyObject()
+			o.fs.perfLog("⏱️ [Truncate] name=%s, size=0, deferred empty object, elapsed=%v", o.name, time.Since(start))
+			return nil
+		}
+
 		putStart := time.Now()
 		if err := o.fs.putEmptyObject(o.name, "application/octet-stream"); err != nil {
 			return err
 		}
+		o.clearPendingEmptyObject()
 		o.currentSize = 0
 		o.sizeKnown = true
+		o.statInfo = &FileInfo{
+			name:     o.name,
+			size:     0,
+			updated:  time.Now(),
+			isDir:    false,
+			fileMode: o.fileMode,
+		}
 		o.fs.perfLog("⏱️ [Truncate.putEmptyObject] name=%s, size=0, putElapsed=%v, totalElapsed=%v", o.name, time.Since(putStart), time.Since(start))
 		return nil
 	}
